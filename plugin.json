@@ -1,0 +1,7 @@
+{
+  "id": "drums",
+  "name": "Drum Highway",
+  "version": "1.0.0",
+  "private": false,
+  "script": "screen.js"
+}
