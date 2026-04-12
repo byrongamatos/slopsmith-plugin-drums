@@ -141,10 +141,10 @@ const COL_MISSED = '#555566';
 // ═══════════════════════════════════════════════════════════════════════
 
 const VISIBLE_SECONDS = 3.0;
-const NOW_LINE_X_FRAC = 0.12;     // Now line at 12% from left
-const LABEL_W = 36;               // Lane label width
-const LANE_PAD = 2;               // Padding between lanes
-const KICK_LANE_EXTRA = 8;        // Extra height for kick lane
+const NOW_LINE_Y_FRAC = 0.85;     // Now line at 85% from top (like guitar/piano)
+const LABEL_H = 24;               // Lane label height at bottom
+const LANE_PAD = 1;               // Padding between lanes
+const KICK_LANE_EXTRA = 20;       // Extra width for kick lane
 
 // ═══════════════════════════════════════════════════════════════════════
 // Script Loader
@@ -167,12 +167,18 @@ function _loadScript(url) {
 
 const WAF_BASE = 'https://surikov.github.io/webaudiofontdata/sound/';
 const WAF_PLAYER_URL = 'https://surikov.github.io/webaudiofont/npm/dist/WebAudioFontPlayer.js';
+const WAF_SF = 'JCLive_sf2_file';
 
-// GM drum kit is program 128 (percussion), channel 10
-// WebAudioFont drum file: 128 * 10 = 12800 → _drum_35_0_JCLive_sf2_file
-// Use the standard drum kit preset
-function _drumWafVar() { return '_drum_35_0_JCLive_sf2_file'; }
-function _drumWafUrl() { return WAF_BASE + '12800_0_JCLive_sf2_file.js'; }
+// WebAudioFont has one file per drum MIDI note:
+//   URL:  128NN_0_JCLive_sf2_file.js   (NN = MIDI note)
+//   Var:  _drum_NN_0_JCLive_sf2_file
+const DRUM_MIDI_NOTES = [35, 36, 38, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 57, 59];
+
+function _drumWafVar(note)  { return '_drum_' + note + '_0_' + WAF_SF; }
+function _drumWafUrl(note)  { return WAF_BASE + '128' + note + '_0_' + WAF_SF + '.js'; }
+
+// Per-note presets
+const _drumPresets = {};  // midiNote -> preset
 
 async function _synthInit() {
     if (_synthPlayer) return;
@@ -198,20 +204,27 @@ async function _synthInit() {
 async function _synthLoadDrumKit() {
     if (!_synthPlayer || !_audioCtx) return;
     _synthLoading = true;
-    const varName = _drumWafVar();
-    try {
-        if (!window[varName]) {
-            await _loadScript(_drumWafUrl());
+
+    // Load all drum note presets in parallel
+    const promises = DRUM_MIDI_NOTES.map(async (note) => {
+        const varName = _drumWafVar(note);
+        try {
+            if (!window[varName]) {
+                await _loadScript(_drumWafUrl(note));
+            }
+            const preset = window[varName];
+            if (preset) {
+                _synthPlayer.adjustPreset(_audioCtx, preset);
+                _drumPresets[note] = preset;
+            }
+        } catch (e) {
+            console.warn('[Drums] Failed to load drum note ' + note + ':', e);
         }
-        const preset = window[varName];
-        if (preset) {
-            _synthPlayer.adjustPreset(_audioCtx, preset);
-            _synthPreset = preset;
-        }
-    } catch (e) {
-        console.warn('[Drums] Failed to load drum kit:', e);
-    }
+    });
+
+    await Promise.all(promises);
     _synthLoading = false;
+    console.log('[Drums] Loaded ' + Object.keys(_drumPresets).length + ' drum presets');
 }
 
 function _synthEnsureCtx() {
@@ -221,13 +234,14 @@ function _synthEnsureCtx() {
 }
 
 function _synthDrumHit(midiNote, velocity) {
-    if (!_synthPlayer || !_synthPreset || !_audioCtx || !_synthGain) return;
+    if (!_synthPlayer || !_audioCtx || !_synthGain) return;
+    const preset = _drumPresets[midiNote];
+    if (!preset) return;
     _synthEnsureCtx();
 
     const vol = (velocity / 127) * _cfg.synthVolume;
-    // Drum hits are short — use a 0.5s duration
     _synthPlayer.queueWaveTable(
-        _audioCtx, _synthGain, _synthPreset, 0, midiNote, 0.5, vol
+        _audioCtx, _synthGain, preset, 0, midiNote, 0.5, vol
     );
 }
 
@@ -752,32 +766,32 @@ function _roundRect(ctx, x, y, w, h, r) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Lane Geometry
+// Lane Geometry (vertical — lanes are columns, notes scroll top to bottom)
 // ═══════════════════════════════════════════════════════════════════════
 
 function _computeLaneLayout(W, H) {
     const numLanes = DRUM_LANES.length;
-    const topPad = 10;
-    const bottomPad = 10;
-    const availH = H - topPad - bottomPad;
+    const padL = 10;
+    const padR = 10;
+    const availW = W - padL - padR;
 
-    // Kick lane gets extra height; separator line drawn above it
+    // Kick lane gets extra width
     const kickIdx = DRUM_LANES.findIndex(l => l.id === 'kick');
-    const regularLaneH = (availH - KICK_LANE_EXTRA - 4) / numLanes;
-    const kickLaneH = regularLaneH + KICK_LANE_EXTRA;
+    const regularW = (availW - KICK_LANE_EXTRA) / numLanes;
+    const kickW = regularW + KICK_LANE_EXTRA;
 
     const lanes = [];
-    let y = topPad;
+    let x = padL;
     for (let i = 0; i < numLanes; i++) {
-        const h = i === kickIdx ? kickLaneH : regularLaneH;
+        const w = i === kickIdx ? kickW : regularW;
         lanes.push({
             idx: i,
             lane: DRUM_LANES[i],
-            y: y,
-            h: h,
-            centerY: y + h / 2,
+            x: x,
+            w: w,
+            centerX: x + w / 2,
         });
-        y += h + LANE_PAD;
+        x += w + LANE_PAD;
     }
     return lanes;
 }
@@ -786,14 +800,15 @@ function _computeLaneLayout(W, H) {
 // Drawing
 // ═══════════════════════════════════════════════════════════════════════
 
-function _timeToX(dt, nowLineX, rightX) {
-    // dt > 0 means note is in the future (to the right of now line)
-    // dt <= 0 means note has passed (to the left of now line)
-    if (dt <= 0) return nowLineX + (dt / 0.3) * 20; // slide left past now line
+function _timeToY(dt, nowLineY, topY) {
+    // dt > 0 means note is in the future (above now line)
+    // dt <= 0 means note has passed (below now line)
+    if (dt <= 0) return nowLineY + (-dt / 0.3) * 20;
     const frac = dt / VISIBLE_SECONDS;
-    return nowLineX + frac * (rightX - nowLineX);
+    return nowLineY - frac * (nowLineY - topY);
 }
 
+let _debugLogged = false;
 function _drumDraw() {
     _rafId = requestAnimationFrame(_drumDraw);
     if (!_drumCanvas || !_drumCtx) return;
@@ -801,6 +816,22 @@ function _drumDraw() {
     const notes = highway.getNotes();
     const chords = highway.getChords();
     const t = highway.getTime();
+
+    if (!_debugLogged && (notes || chords)) {
+        _debugLogged = true;
+        const noteCount = notes ? notes.length : 0;
+        const chordCount = chords ? chords.length : 0;
+        console.log('[Drums] Highway data:', noteCount, 'notes,', chordCount, 'chords');
+        if (notes && notes.length > 0) {
+            const sample = notes.slice(0, 5).map(n => {
+                const midi = noteToMidi(n.s, n.f);
+                const lane = _songNoteToLaneIdx(midi);
+                return `s=${n.s} f=${n.f} midi=${midi} lane=${lane}`;
+            });
+            console.log('[Drums] First notes:', sample);
+        }
+        console.log('[Drums] Song info:', highway.getSongInfo());
+    }
 
     if (!notes && !chords) return;
 
@@ -810,8 +841,8 @@ function _drumDraw() {
 
     _updateMissedNotes(t);
 
-    const nowLineX = W * NOW_LINE_X_FRAC;
-    const rightX = W - 10;
+    const nowLineY = H * NOW_LINE_Y_FRAC;
+    const topY = 0;
     const laneLayout = _computeLaneLayout(W, H);
     const kickIdx = DRUM_LANES.findIndex(l => l.id === 'kick');
 
@@ -819,21 +850,21 @@ function _drumDraw() {
     ctx.fillStyle = '#040408';
     ctx.fillRect(0, 0, W, H);
 
-    // ── Lane backgrounds ────────────────────────────────────────────
+    // ── Lane backgrounds (vertical columns) ─────────────────────────
     for (let i = 0; i < laneLayout.length; i++) {
         const ll = laneLayout[i];
         const [r, g, b] = ll.lane.color;
 
         // Subtle lane background stripe
-        ctx.fillStyle = _rgbStr(r * 0.08, g * 0.08, b * 0.08, 0.5);
-        ctx.fillRect(LABEL_W, ll.y, W - LABEL_W, ll.h);
+        ctx.fillStyle = _rgbStr(r * 0.06, g * 0.06, b * 0.06, 0.5);
+        ctx.fillRect(ll.x, topY, ll.w, nowLineY + 20);
 
-        // Lane border
-        ctx.strokeStyle = _rgbStr(r * 0.2, g * 0.2, b * 0.2, 0.3);
+        // Lane border (right edge)
+        ctx.strokeStyle = _rgbStr(r * 0.15, g * 0.15, b * 0.15, 0.3);
         ctx.lineWidth = 0.5;
         ctx.beginPath();
-        ctx.moveTo(LABEL_W, ll.y + ll.h);
-        ctx.lineTo(W, ll.y + ll.h);
+        ctx.moveTo(ll.x + ll.w, topY);
+        ctx.lineTo(ll.x + ll.w, nowLineY + 20);
         ctx.stroke();
 
         // Lane flash (from MIDI hit)
@@ -841,56 +872,56 @@ function _drumDraw() {
             if (flash.laneIdx === i) {
                 const age = (performance.now() - flash.wall) / 300;
                 if (age < 1) {
-                    ctx.fillStyle = _rgbStr(r, g, b, 0.3 * (1 - age));
-                    ctx.fillRect(LABEL_W, ll.y, W - LABEL_W, ll.h);
+                    ctx.fillStyle = _rgbStr(r, g, b, 0.25 * (1 - age));
+                    ctx.fillRect(ll.x, topY, ll.w, nowLineY + 20);
                 }
             }
         }
     }
 
-    // ── Kick lane separator ─────────────────────────────────────────
+    // ── Kick lane separator (left edge of kick column) ──────────────
     if (kickIdx >= 0) {
         const kickLL = laneLayout[kickIdx];
         ctx.strokeStyle = 'rgba(255,80,80,0.3)';
         ctx.lineWidth = 2;
         ctx.setLineDash([4, 4]);
         ctx.beginPath();
-        ctx.moveTo(LABEL_W, kickLL.y - 2);
-        ctx.lineTo(W, kickLL.y - 2);
+        ctx.moveTo(kickLL.x - 2, topY);
+        ctx.lineTo(kickLL.x - 2, nowLineY + 20);
         ctx.stroke();
         ctx.setLineDash([]);
     }
 
-    // ── Beat / measure lines ────────────────────────────────────────
+    // ── Beat / measure lines (horizontal) ───────────────────────────
     const beats = highway.getBeats();
     if (beats) {
         for (const b of beats) {
             const dt = b.time - t;
             if (dt < -0.1 || dt > VISIBLE_SECONDS) continue;
-            const x = _timeToX(dt, nowLineX, rightX);
+            const y = _timeToY(dt, nowLineY, topY);
             ctx.strokeStyle = b.measure > 0 ? 'rgba(255,255,255,0.1)' : 'rgba(255,255,255,0.03)';
             ctx.lineWidth = b.measure > 0 ? 1 : 0.5;
             ctx.beginPath();
-            ctx.moveTo(x, laneLayout[0].y);
-            ctx.lineTo(x, laneLayout[laneLayout.length - 1].y + laneLayout[laneLayout.length - 1].h);
+            ctx.moveTo(laneLayout[0].x, y);
+            ctx.lineTo(laneLayout[laneLayout.length - 1].x + laneLayout[laneLayout.length - 1].w, y);
             ctx.stroke();
         }
     }
 
-    // ── Now line ────────────────────────────────────────────────────
+    // ── Now line (horizontal) ───────────────────────────────────────
     ctx.strokeStyle = 'rgba(255,255,255,0.5)';
     ctx.lineWidth = 2;
     ctx.beginPath();
-    ctx.moveTo(nowLineX, laneLayout[0].y);
-    ctx.lineTo(nowLineX, laneLayout[laneLayout.length - 1].y + laneLayout[laneLayout.length - 1].h);
+    ctx.moveTo(laneLayout[0].x, nowLineY);
+    ctx.lineTo(laneLayout[laneLayout.length - 1].x + laneLayout[laneLayout.length - 1].w, nowLineY);
     ctx.stroke();
 
     // ── Scrolling notes ─────────────────────────────────────────────
-    _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineX, rightX, W);
+    _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY, W, H);
 
-    // ── Lane labels ─────────────────────────────────────────────────
+    // ── Lane labels (at the bottom, below now line) ─────────────────
     if (_cfg.showLaneLabels) {
-        _drawLaneLabels(ctx, laneLayout);
+        _drawLaneLabels(ctx, laneLayout, nowLineY, H);
     }
 
     // ── Accuracy HUD ────────────────────────────────────────────────
@@ -912,9 +943,9 @@ function _drumDraw() {
     }
 }
 
-// ── Draw Scrolling Notes ────────────────────────────────────────────
+// ── Draw Scrolling Notes (vertical — notes fall top to bottom) ──────
 
-function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineX, rightX, W) {
+function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY, W, H) {
     const allNotes = [];
 
     if (notes) {
@@ -943,10 +974,10 @@ function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineX, rightX
         const ll = laneLayout[laneIdx];
         const lane = ll.lane;
         const dt = n.t - t;
-        const x = _timeToX(dt, nowLineX, rightX);
+        const y = _timeToY(dt, nowLineY, topY);
 
         // Skip if off-screen
-        if (x < LABEL_W - 20 || x > rightX + 20) continue;
+        if (y < -20 || y > nowLineY + 30) continue;
 
         const isActive = Math.abs(dt) < 0.03;
 
@@ -962,204 +993,170 @@ function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineX, rightX
         if (useHitColor) { cr = 0; cg = 1; cb = 0.27; }
         else if (useMissColor) { cr = 0.33; cg = 0.33; cb = 0.4; }
 
-        // Velocity-based sizing
         const velFactor = n.ac ? 1.3 : 1.0;
+        const cx = ll.centerX;
 
         if (lane.id === 'kick') {
-            // ── Kick: full-width bar ────────────────────────────────
-            const barH = ll.h * 0.6 * velFactor;
-            const barY = ll.centerY - barH / 2;
+            // ── Kick: full-height bar spanning all lanes ────────────
+            const barW = ll.w * 0.6 * velFactor;
+            const barH = Math.max(4, 8 * velFactor);
+            const firstLane = laneLayout[0];
+            const lastLane = laneLayout[laneLayout.length - 1];
+            const fullLeft = firstLane.x;
+            const fullRight = lastLane.x + lastLane.w;
 
-            // Neon glow
+            // Full-width bar across all lanes
             if (!useMissColor) {
-                const glowAlpha = isActive ? 0.5 : 0.2;
-                for (let i = 2; i >= 0; i--) {
-                    const spread = (i + 1) * 3;
-                    const a = glowAlpha * (0.1 + (2 - i) * 0.1);
-                    ctx.fillStyle = _rgbStr(cr, cg, cb, a);
-                    ctx.fillRect(x - spread, barY - spread, (nowLineX - x > 0 ? 4 : W - LABEL_W) + spread * 2, barH + spread * 2);
+                const glowAlpha = isActive ? 0.4 : 0.15;
+                for (let i = 1; i >= 0; i--) {
+                    const spread = (i + 1) * 2;
+                    ctx.fillStyle = _rgbStr(cr, cg, cb, glowAlpha * (0.3 + (1 - i) * 0.2));
+                    ctx.fillRect(fullLeft, y - barH / 2 - spread, fullRight - fullLeft, barH + spread * 2);
                 }
             }
 
-            // Solid bar (narrow width centered on x)
-            const barW = Math.max(6, 10 * velFactor);
-            ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 0.85);
-            ctx.fillRect(x - barW / 2, barY, barW, barH);
+            ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.2 : 0.5);
+            ctx.fillRect(fullLeft, y - barH / 2, fullRight - fullLeft, barH);
 
-            // Full-width line at the center
-            ctx.strokeStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.15 : 0.4);
-            ctx.lineWidth = 2;
-            ctx.beginPath();
-            ctx.moveTo(LABEL_W, ll.centerY);
-            ctx.lineTo(x, ll.centerY);
-            ctx.stroke();
+            // Brighter bar in the kick column
+            ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 0.9);
+            ctx.fillRect(ll.x + 2, y - barH / 2, ll.w - 4, barH);
 
-            // Active flash: entire kick area
+            // Active flash
             if (isActive && !useMissColor) {
-                ctx.fillStyle = _rgbStr(cr, cg, cb, 0.15);
-                ctx.fillRect(LABEL_W, ll.y, W - LABEL_W, ll.h);
+                ctx.fillStyle = _rgbStr(cr, cg, cb, 0.12);
+                ctx.fillRect(fullLeft, nowLineY - 5, fullRight - fullLeft, 10);
             }
         } else if (lane.symbol === 'diamond') {
             // ── Cymbal: diamond shape ───────────────────────────────
-            const size = (ll.h * 0.3) * velFactor;
+            const size = (ll.w * 0.25) * velFactor;
 
-            // Neon glow
-            if (!useMissColor) {
-                const glowAlpha = isActive ? 0.5 : 0.2;
-                for (let i = 2; i >= 0; i--) {
-                    const spread = (i + 1) * 2;
-                    const a = glowAlpha * (0.12 + (2 - i) * 0.1);
-                    ctx.strokeStyle = _rgbStr(cr, cg, cb, a);
-                    ctx.lineWidth = spread;
-                    ctx.beginPath();
-                    ctx.moveTo(x, ll.centerY - size - spread);
-                    ctx.lineTo(x + size + spread, ll.centerY);
-                    ctx.lineTo(x, ll.centerY + size + spread);
-                    ctx.lineTo(x - size - spread, ll.centerY);
-                    ctx.closePath();
-                    ctx.stroke();
-                }
-            }
-
-            // Solid diamond
-            ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 1);
-            ctx.beginPath();
-            ctx.moveTo(x, ll.centerY - size);
-            ctx.lineTo(x + size, ll.centerY);
-            ctx.lineTo(x, ll.centerY + size);
-            ctx.lineTo(x - size, ll.centerY);
-            ctx.closePath();
-            ctx.fill();
-
-            // Highlight
-            if (!useMissColor && size > 4) {
-                const grad = ctx.createLinearGradient(x - size, ll.centerY - size, x + size, ll.centerY);
-                grad.addColorStop(0, _rgbStr(Math.min(cr + 0.3, 1), Math.min(cg + 0.3, 1), Math.min(cb + 0.3, 1), 0.3));
-                grad.addColorStop(1, 'rgba(0,0,0,0)');
-                ctx.fillStyle = grad;
-                ctx.beginPath();
-                ctx.moveTo(x, ll.centerY - size);
-                ctx.lineTo(x + size, ll.centerY);
-                ctx.lineTo(x, ll.centerY + size);
-                ctx.lineTo(x - size, ll.centerY);
-                ctx.closePath();
-                ctx.fill();
-            }
-        } else if (lane.id === 'hihat') {
-            // ── Hi-hat: X shapes with variation ─────────────────────
-            const size = (ll.h * 0.28) * velFactor;
-            const isOpen = n.midi === 46;
-            const isPedal = n.midi === 44;
-
-            // Neon glow
             if (!useMissColor) {
                 const glowAlpha = isActive ? 0.5 : 0.2;
                 for (let i = 1; i >= 0; i--) {
                     const spread = (i + 1) * 2;
                     const a = glowAlpha * (0.15 + (1 - i) * 0.15);
                     ctx.strokeStyle = _rgbStr(cr, cg, cb, a);
-                    ctx.lineWidth = spread + 2;
-                    const cy = isPedal ? ll.y + ll.h - size * 0.8 : ll.centerY;
-                    const s = isPedal ? size * 0.6 : size;
+                    ctx.lineWidth = spread;
                     ctx.beginPath();
-                    ctx.moveTo(x - s, cy - s);
-                    ctx.lineTo(x + s, cy + s);
-                    ctx.moveTo(x + s, cy - s);
-                    ctx.lineTo(x - s, cy + s);
+                    ctx.moveTo(cx, y - size - spread);
+                    ctx.lineTo(cx + size + spread, y);
+                    ctx.lineTo(cx, y + size + spread);
+                    ctx.lineTo(cx - size - spread, y);
+                    ctx.closePath();
                     ctx.stroke();
                 }
             }
 
-            const cy = isPedal ? ll.y + ll.h - size * 0.8 : ll.centerY;
+            ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 1);
+            ctx.beginPath();
+            ctx.moveTo(cx, y - size);
+            ctx.lineTo(cx + size, y);
+            ctx.lineTo(cx, y + size);
+            ctx.lineTo(cx - size, y);
+            ctx.closePath();
+            ctx.fill();
+        } else if (lane.id === 'hihat') {
+            // ── Hi-hat: X shapes with variation ─────────────────────
+            const size = (ll.w * 0.22) * velFactor;
+            const isOpen = n.midi === 46;
+            const isPedal = n.midi === 44;
             const s = isPedal ? size * 0.6 : size;
 
+            if (!useMissColor) {
+                const glowAlpha = isActive ? 0.5 : 0.2;
+                ctx.strokeStyle = _rgbStr(cr, cg, cb, glowAlpha * 0.3);
+                ctx.lineWidth = 4;
+                ctx.beginPath();
+                ctx.moveTo(cx - s, y - s);
+                ctx.lineTo(cx + s, y + s);
+                ctx.moveTo(cx + s, y - s);
+                ctx.lineTo(cx - s, y + s);
+                ctx.stroke();
+            }
+
             if (isOpen) {
-                // Open hi-hat: ring/circle
                 ctx.strokeStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 1);
                 ctx.lineWidth = 2.5;
                 ctx.beginPath();
-                ctx.arc(x, cy, s, 0, Math.PI * 2);
+                ctx.arc(cx, y, s, 0, Math.PI * 2);
                 ctx.stroke();
-                // Small "o" inside
                 ctx.font = `bold ${Math.max(8, s * 0.7)}px sans-serif`;
                 ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 0.8);
                 ctx.textAlign = 'center';
                 ctx.textBaseline = 'middle';
-                ctx.fillText('o', x, cy);
+                ctx.fillText('o', cx, y);
             } else {
-                // Closed / pedal hi-hat: X shape
                 ctx.strokeStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 1);
                 ctx.lineWidth = isPedal ? 1.5 : 2.5;
                 ctx.beginPath();
-                ctx.moveTo(x - s, cy - s);
-                ctx.lineTo(x + s, cy + s);
-                ctx.moveTo(x + s, cy - s);
-                ctx.lineTo(x - s, cy + s);
+                ctx.moveTo(cx - s, y - s);
+                ctx.lineTo(cx + s, y + s);
+                ctx.moveTo(cx + s, y - s);
+                ctx.lineTo(cx - s, y + s);
                 ctx.stroke();
             }
         } else {
             // ── Toms / Snare: circles ───────────────────────────────
-            const radius = (ll.h * 0.3) * velFactor;
+            const radius = (ll.w * 0.25) * velFactor;
 
-            // Neon glow
             if (!useMissColor) {
                 const glowAlpha = isActive ? 0.5 : 0.2;
-                for (let i = 2; i >= 0; i--) {
+                for (let i = 1; i >= 0; i--) {
                     const spread = (i + 1) * 2;
-                    const a = glowAlpha * (0.12 + (2 - i) * 0.1);
+                    const a = glowAlpha * (0.15 + (1 - i) * 0.15);
                     ctx.strokeStyle = _rgbStr(cr, cg, cb, a);
                     ctx.lineWidth = spread;
                     ctx.beginPath();
-                    ctx.arc(x, ll.centerY, radius + spread, 0, Math.PI * 2);
+                    ctx.arc(cx, y, radius + spread, 0, Math.PI * 2);
                     ctx.stroke();
                 }
             }
 
-            // Solid circle
             ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 1);
             ctx.beginPath();
-            ctx.arc(x, ll.centerY, radius, 0, Math.PI * 2);
+            ctx.arc(cx, y, radius, 0, Math.PI * 2);
             ctx.fill();
 
-            // Highlight gradient
             if (!useMissColor && radius > 4) {
-                const grad = ctx.createRadialGradient(x - radius * 0.3, ll.centerY - radius * 0.3, 0, x, ll.centerY, radius);
+                const grad = ctx.createRadialGradient(cx - radius * 0.3, y - radius * 0.3, 0, cx, y, radius);
                 grad.addColorStop(0, _rgbStr(Math.min(cr + 0.3, 1), Math.min(cg + 0.3, 1), Math.min(cb + 0.3, 1), 0.4));
                 grad.addColorStop(1, 'rgba(0,0,0,0)');
                 ctx.fillStyle = grad;
                 ctx.beginPath();
-                ctx.arc(x, ll.centerY, radius, 0, Math.PI * 2);
+                ctx.arc(cx, y, radius, 0, Math.PI * 2);
                 ctx.fill();
             }
         }
     }
 }
 
-// ── Lane Labels ─────────────────────────────────────────────────────
+// ── Lane Labels (at the bottom of each column) ─────────────────────
 
-function _drawLaneLabels(ctx, laneLayout) {
+function _drawLaneLabels(ctx, laneLayout, nowLineY, H) {
+    const labelY = nowLineY + 8;
+    const labelH = H - labelY;
+
+    // Label background strip
+    ctx.fillStyle = 'rgba(8,8,20,0.85)';
+    ctx.fillRect(0, labelY, laneLayout[laneLayout.length - 1].x + laneLayout[laneLayout.length - 1].w + 10, labelH);
+
+    // Top border
+    ctx.strokeStyle = 'rgba(255,255,255,0.1)';
+    ctx.lineWidth = 1;
+    ctx.beginPath();
+    ctx.moveTo(0, labelY);
+    ctx.lineTo(laneLayout[laneLayout.length - 1].x + laneLayout[laneLayout.length - 1].w + 10, labelY);
+    ctx.stroke();
+
     ctx.textAlign = 'center';
     ctx.textBaseline = 'middle';
 
     for (const ll of laneLayout) {
         const [r, g, b] = ll.lane.color;
-
-        // Label background
-        ctx.fillStyle = 'rgba(8,8,20,0.8)';
-        ctx.fillRect(0, ll.y, LABEL_W, ll.h);
-
-        // Label text
         ctx.font = 'bold 11px sans-serif';
         ctx.fillStyle = _rgbStr(r, g, b, 0.9);
-        ctx.fillText(ll.lane.label, LABEL_W / 2, ll.centerY);
-
-        // Right border
-        ctx.strokeStyle = _rgbStr(r * 0.3, g * 0.3, b * 0.3, 0.4);
-        ctx.lineWidth = 1;
-        ctx.beginPath();
-        ctx.moveTo(LABEL_W, ll.y);
-        ctx.lineTo(LABEL_W, ll.y + ll.h);
-        ctx.stroke();
+        ctx.fillText(ll.lane.label, ll.centerX, labelY + labelH / 2);
     }
 }
 
