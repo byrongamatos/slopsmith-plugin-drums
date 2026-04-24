@@ -1,69 +1,202 @@
-// Drum Highway plugin — lane-based scrolling drum renderer (Rock Band-style)
-// with MIDI drum pad input, WebAudioFont drum kit sounds, and accuracy scoring.
-// Activates when a "Drums" arrangement is loaded, or via toggle button.
+// Drum Highway visualization plugin — lane-based scrolling drum
+// renderer (Rock Band-style) with MIDI drum pad input, WebAudioFont
+// drum kit sounds, and accuracy scoring.
+//
+// Wave B migration (slopsmith#36): the plugin used to wrap
+// window.playSong and toggle itself on/off based on arrangement name.
+// That activation model has been replaced by slopsmith core's viz
+// picker + Auto mode. This file now exports a setRenderer factory at
+// window.slopsmithViz_drums and declares matchesArrangement so Auto
+// mode picks drums automatically on Drums / Percussion arrangements.
+//
+// Single-instance assumption: overlay canvas, scoring state, and
+// settings panel live at module scope. The main-player viz picker
+// constructs at most one instance at a time, so this is correct
+// today. Splitscreen's per-panel setRenderer adoption (Wave C) will
+// re-factor these into createFactory closures.
 
 (function () {
 'use strict';
 
 // ═══════════════════════════════════════════════════════════════════════
-// State
+// Config
 // ═══════════════════════════════════════════════════════════════════════
 
-let _drumEnabled = false;
-let _drumAuto = false;
-let _drumCanvas = null;
-let _drumCtx = null;
-let _rafId = null;
-let _settingsPanel = null;
-let _settingsVisible = false;
+// Word-boundary match so unrelated arrangement names don't trigger
+// Auto-drums via a substring hit — e.g. "Drumstick" (hypothetical)
+// must NOT match "drums". The \b anchors still catch standard
+// Rocksmith arrangement labels cleanly: "Drums", "Drum Kit",
+// "Percussion", "Electronic Drums", etc.
+const DRUMS_PATTERNS = /\b(?:drums|percussion|drum\s*kit)\b/i;
+const VISIBLE_SECONDS = 3.0;
+const NOW_LINE_Y_FRAC = 0.85;
+const LANE_PAD = 1;
+const KICK_LANE_EXTRA = 20;
+const HIT_TOLERANCE = 0.05;        // seconds (drums need tighter timing than piano)
 
 // ── Persisted settings ───────────────────────────────────────────────
+//
+// Explicit map from in-memory property name to localStorage key so
+// read and write always agree. The previous code read from
+// hand-picked keys but wrote to snake-cased derivatives ('midiChannel'
+// → 'drums_midi_channel' not 'drums_midi_ch'), silently losing saves
+// on every reload.
+
+const STORE_KEYS = {
+    midiInputId:    'drums_midi_input',
+    synthVolume:    'drums_synth_vol',
+    midiChannel:    'drums_midi_ch',
+    hitDetection:   'drums_hit_detect',
+    showLaneLabels: 'drums_lane_labels',
+    customMapping:  'drums_custom_map',
+};
+
+// Safe localStorage reader — getItem can throw SecurityError in
+// sandboxed iframes, under Safari on file://, or when storage is
+// disabled for the origin. An unguarded throw during the _cfg
+// initialiser would abort the IIFE and the plugin would never
+// register its setRenderer factory. Return null on failure so the
+// `|| default` fallthrough below still produces a usable value.
+function _readStore(key) {
+    try { return localStorage.getItem(key); } catch (_) { return null; }
+}
+
+// Numeric cfg normaliser — parseFloat/parseInt return NaN on junk
+// like "foo" or "", which would propagate into AudioParam.gain.value
+// (breaks playback) or MIDI channel filtering (misroutes events).
+// Clamp to [min, max] when provided and fall back to the default on
+// any non-finite result.
+function _readNum(key, fallback, min, max) {
+    const raw = _readStore(key);
+    if (raw == null) return fallback;
+    const n = parseFloat(raw);
+    if (!Number.isFinite(n)) return fallback;
+    if (min !== undefined && n < min) return min;
+    if (max !== undefined && n > max) return max;
+    return n;
+}
+
+// Lane ids declared here so the customMapping validator below can
+// shape-check persisted user mappings. The full DRUM_LANES table
+// appears further down (with colors, symbols, MIDI-note lists); the
+// ids are duplicated here once because _cfg initialises before the
+// DRUM_LANES block runs.
+const _VALID_LANE_IDS = new Set([
+    'hihat', 'snare', 'tom1', 'tom2', 'tom3', 'crash', 'ride', 'kick',
+]);
+
+// Validate a customMapping object loaded from localStorage. Storage
+// is user-controlled (manual edits, another plugin, synced profiles),
+// so parsing the raw JSON is NOT enough — we need to reject
+// non-object / array inputs, strip __proto__ / constructor /
+// prototype keys to block prototype-pollution, and drop any
+// (key, value) pair that isn't (MIDI note 0-127, known lane id).
+// Returns a clean null-prototype object, or null if nothing survives.
+function _validateCustomMapping(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const clean = Object.create(null);
+    let hasEntries = false;
+    for (const key of Object.keys(raw)) {
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+        const midi = parseInt(key, 10);
+        if (!Number.isFinite(midi) || midi < 0 || midi > 127) continue;
+        const val = raw[key];
+        if (typeof val !== 'string' || !_VALID_LANE_IDS.has(val)) continue;
+        clean[midi] = val;
+        hasEntries = true;
+    }
+    return hasEntries ? clean : null;
+}
 
 const _cfg = {
-    midiInputId:   localStorage.getItem('drums_midi_input') || '',
-    synthVolume:   parseFloat(localStorage.getItem('drums_synth_vol') || '0.7'),
-    midiChannel:   parseInt(localStorage.getItem('drums_midi_ch') || '-1'),  // -1 = all, 9 = ch10
-    hitDetection:  localStorage.getItem('drums_hit_detect') === 'true',
-    showLaneLabels: localStorage.getItem('drums_lane_labels') !== 'false',
-    customMapping: JSON.parse(localStorage.getItem('drums_custom_map') || 'null'),
-    learnLane:     null,  // transient: which lane is in learn mode
+    midiInputId:    _readStore(STORE_KEYS.midiInputId) || '',
+    synthVolume:    _readNum(STORE_KEYS.synthVolume, 0.7, 0, 1),
+    // -1 = all, 0..15 are the 16 MIDI channels (9 = "ch10" Drums)
+    midiChannel:    Math.round(_readNum(STORE_KEYS.midiChannel, -1, -1, 15)),
+    hitDetection:   _readStore(STORE_KEYS.hitDetection) === 'true',
+    showLaneLabels: _readStore(STORE_KEYS.showLaneLabels) !== 'false',
+    customMapping:  (function () {
+        try {
+            const raw = JSON.parse(_readStore(STORE_KEYS.customMapping) || 'null');
+            return _validateCustomMapping(raw);
+        } catch (_) { return null; }
+    })(),
+    learnLane:      null,  // transient: which lane is in learn mode
 };
 
 function _saveCfg(key, val) {
-    _cfg[key] = val;
-    const storeKey = 'drums_' + key.replace(/[A-Z]/g, c => '_' + c.toLowerCase());
-    if (typeof val === 'object' && val !== null) {
-        localStorage.setItem(storeKey, JSON.stringify(val));
-    } else {
-        localStorage.setItem(storeKey, String(val));
+    // Apply the same shape validation the _cfg initialiser uses so
+    // anything we write to localStorage is also trustworthy on next
+    // load. Belt-and-suspenders — Learn-mode builds its map from
+    // Object.assign({}, _getActiveDrumMap()) + a fresh midi+laneId
+    // pair, so input is already well-formed, but routing through
+    // the validator means any future caller can't accidentally
+    // persist garbage.
+    if (key === 'customMapping' && val !== null) {
+        val = _validateCustomMapping(val);
     }
+    _cfg[key] = val;
+    const storeKey = STORE_KEYS[key];
+    if (!storeKey) return;
+    const serialised = typeof val === 'object' && val !== null
+        ? JSON.stringify(val) : String(val);
+    try { localStorage.setItem(storeKey, serialised); } catch (_) {}
 }
 
-// ── MIDI input state ─────────────────────────────────────────────────
+// ═══════════════════════════════════════════════════════════════════════
+// Module-level singleton state
+// ═══════════════════════════════════════════════════════════════════════
 
+// ── MIDI input ────────────────────────────────────────────────────────
 let _midiAccess = null;
 let _midiInput = null;
+// Gates onmidimessage wiring. init() flips true via _midiResumeHandler
+// and destroy() flips false via _midiPauseHandler. Because _midiInit
+// is async, a requestMIDIAccess promise begun in init() can resolve
+// AFTER destroy() has already run — the resulting _midiAutoConnect
+// would otherwise assign `_midiInput.onmidimessage = _midiOnMessage`
+// on a no-longer-visible renderer, bringing synth + scoring back in
+// the background. Every callsite that would attach the handler
+// consults this flag first.
+let _midiActive = false;
 const _heldPads = new Map();       // midi note -> {velocity, wall}
 
-// ── Synth state ──────────────────────────────────────────────────────
-
+// ── Synth ─────────────────────────────────────────────────────────────
 let _audioCtx = null;
 let _synthPlayer = null;
-let _synthPreset = null;
 let _synthGain = null;
 let _synthLoading = false;
 let _playerScriptLoaded = false;
+const _drumPresets = {};           // midiNote -> preset
 
-// ── Hit detection state ──────────────────────────────────────────────
+// ── Rendering / scoring (single active instance) ──────────────────────
+let _drumCanvas = null;
+let _drumCtx = null;
+let _settingsPanel = null;
+let _settingsGear = null;
+let _settingsVisible = false;
+let _highwayCanvas = null;
+let _prevHighwayDisplay = '';
+// #player-controls inline-style snapshot. _createOverlayCanvas
+// nudges position + zIndex so the controls strip stays above the
+// overlay; destroy() must restore those verbatim so the inline
+// override doesn't leak into whichever renderer comes next.
+let _controlsStyleTouched = false;
+let _prevControlsPosition = '';
+let _prevControlsZIndex = '';
 
-const HIT_TOLERANCE = 0.05;        // seconds (drums need tighter timing)
 let _hits = 0, _misses = 0, _streak = 0, _bestStreak = 0;
-const _hitNoteKeys = new Set();     // "time|midi" strings for correctly hit notes
-const _wrongFlashes = [];           // [{lane, wall}] for brief flashes
-const _missedNoteKeys = new Set();  // "time|midi" strings for notes that passed unplayed
+const _hitNoteKeys = new Set();
+const _wrongFlashes = [];          // [{lane, wall}]
+const _missedNoteKeys = new Set();
+const _laneFlashes = [];           // [{laneIdx, wall, color}]
 
-// ── Lane flash state ─────────────────────────────────────────────────
-const _laneFlashes = [];            // [{laneIdx, wall, color}]
+// Latest filtered arrays cached by draw(bundle) so async MIDI hits
+// (_checkHit) can score against the same difficulty-filtered chart
+// the user sees. highway.getNotes()/.getChords() are unfiltered.
+let _latestNotes = null;
+let _latestChords = null;
+let _latestTime = 0;
 
 // ═══════════════════════════════════════════════════════════════════════
 // MIDI / Drum Mapping
@@ -116,13 +249,12 @@ function _midiToLaneIdx(midiNote) {
     return DRUM_LANES.findIndex(l => l.id === laneId);
 }
 
-// Map a song note (encoded as string*24+fret) to a lane index
 function _songNoteToLaneIdx(midi) {
     return _midiToLane[midi] !== undefined ? _midiToLane[midi] : -1;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Color Helpers
+// Color helper
 // ═══════════════════════════════════════════════════════════════════════
 
 function _rgbStr(r, g, b, a) {
@@ -131,23 +263,8 @@ function _rgbStr(r, g, b, a) {
         : `rgb(${(r * 255) | 0},${(g * 255) | 0},${(b * 255) | 0})`;
 }
 
-// Feedback colors
-const COL_HIT    = '#00ff44';
-const COL_WRONG  = '#ff4444';
-const COL_MISSED = '#555566';
-
 // ═══════════════════════════════════════════════════════════════════════
-// Configuration
-// ═══════════════════════════════════════════════════════════════════════
-
-const VISIBLE_SECONDS = 3.0;
-const NOW_LINE_Y_FRAC = 0.85;     // Now line at 85% from top (like guitar/piano)
-const LABEL_H = 24;               // Lane label height at bottom
-const LANE_PAD = 1;               // Padding between lanes
-const KICK_LANE_EXTRA = 20;       // Extra width for kick lane
-
-// ═══════════════════════════════════════════════════════════════════════
-// Script Loader
+// Script loader
 // ═══════════════════════════════════════════════════════════════════════
 
 function _loadScript(url) {
@@ -162,23 +279,17 @@ function _loadScript(url) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// WebAudioFont Drum Kit Synthesizer
+// WebAudioFont drum kit synthesizer
 // ═══════════════════════════════════════════════════════════════════════
 
 const WAF_BASE = 'https://surikov.github.io/webaudiofontdata/sound/';
 const WAF_PLAYER_URL = 'https://surikov.github.io/webaudiofont/npm/dist/WebAudioFontPlayer.js';
 const WAF_SF = 'JCLive_sf2_file';
 
-// WebAudioFont has one file per drum MIDI note:
-//   URL:  128NN_0_JCLive_sf2_file.js   (NN = MIDI note)
-//   Var:  _drum_NN_0_JCLive_sf2_file
 const DRUM_MIDI_NOTES = [35, 36, 38, 40, 41, 42, 43, 44, 45, 46, 47, 48, 49, 50, 51, 57, 59];
 
 function _drumWafVar(note)  { return '_drum_' + note + '_0_' + WAF_SF; }
 function _drumWafUrl(note)  { return WAF_BASE + '128' + note + '_0_' + WAF_SF + '.js'; }
-
-// Per-note presets
-const _drumPresets = {};  // midiNote -> preset
 
 async function _synthInit() {
     if (_synthPlayer) return;
@@ -205,7 +316,6 @@ async function _synthLoadDrumKit() {
     if (!_synthPlayer || !_audioCtx) return;
     _synthLoading = true;
 
-    // Load all drum note presets in parallel
     const promises = DRUM_MIDI_NOTES.map(async (note) => {
         const varName = _drumWafVar(note);
         try {
@@ -224,7 +334,6 @@ async function _synthLoadDrumKit() {
 
     await Promise.all(promises);
     _synthLoading = false;
-    console.log('[Drums] Loaded ' + Object.keys(_drumPresets).length + ' drum presets');
 }
 
 function _synthEnsureCtx() {
@@ -251,7 +360,7 @@ function _synthSetVolume(vol) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Web MIDI Input
+// Web MIDI input
 // ═══════════════════════════════════════════════════════════════════════
 
 async function _midiInit() {
@@ -261,6 +370,11 @@ async function _midiInit() {
         _midiAccess = await navigator.requestMIDIAccess({ sysex: false });
         _midiAccess.onstatechange = () => _midiUpdateDeviceList();
         _midiAutoConnect();
+        // Populate the settings panel's MIDI <select> even when
+        // _midiAutoConnect bailed early (no devices, or user's saved
+        // "None" opt-out). Without this the dropdown stays stuck on
+        // the initial "None" option until a device statechange fires.
+        _midiUpdateDeviceList();
     } catch (e) {
         console.warn('[Drums] MIDI access denied:', e);
     }
@@ -272,8 +386,15 @@ function _midiAutoConnect() {
     _midiAccess.inputs.forEach(inp => inputs.push(inp));
     if (!inputs.length) return;
 
-    const saved = _cfg.midiInputId;
-    const target = inputs.find(i => i.id === saved) || inputs[0];
+    // Distinguish "never picked a device" from "explicitly picked
+    // None". _readStore returns null for the never-set case (and
+    // for storage-disabled contexts) and '' for an explicit-None
+    // save via _midiConnect. Only respect the explicit-None
+    // sentinel; fall through to inputs[0] on the null branch.
+    const raw = _readStore(STORE_KEYS.midiInputId);
+    if (raw === '') return;
+
+    const target = inputs.find(i => i.id === raw) || inputs[0];
     _midiConnect(target.id);
 }
 
@@ -281,22 +402,60 @@ function _midiConnect(id) {
     if (_midiInput) _midiInput.onmidimessage = null;
     _midiInput = null;
 
-    if (!_midiAccess) return;
+    // Release anything currently sounding / held on the OLD device
+    // before we swap. Drum notes are short (queueWaveTable duration
+    // 0.5s) so hung tones are less likely than for piano, but
+    // _heldPads drives on-screen lane pressed state and would
+    // otherwise keep the prior hit animating after a device swap.
+    _releaseAllSounding();
+
+    // Persist regardless of match. Empty id is the explicit "None"
+    // option and must be saved so _midiAutoConnect respects the
+    // opt-out on next init instead of auto-picking inputs[0] again.
+    _saveCfg('midiInputId', id || '');
+
+    if (!id || !_midiAccess) {
+        _midiUpdateDeviceList();
+        return;
+    }
     _midiAccess.inputs.forEach(inp => {
         if (inp.id === id) {
             _midiInput = inp;
-            _midiInput.onmidimessage = _midiOnMessage;
-            _saveCfg('midiInputId', id);
+            // Wire the handler only when the renderer is active.
+            // A late _midiConnect from an async _midiInit that
+            // resolved post-destroy would otherwise re-enable
+            // scoring / synth in the background.
+            if (_midiActive) _midiInput.onmidimessage = _midiOnMessage;
         }
     });
     _midiUpdateDeviceList();
+}
+
+function _midiPauseHandler() {
+    // Called from destroy() — detach the message handler so the
+    // connected kit stops firing _onDrumHit into a plugin no longer
+    // visible. Flipping _midiActive BEFORE the detach also prevents
+    // a late-resolving _midiConnect (from an in-flight _midiInit
+    // started in the most recent init()) from re-wiring the handler
+    // on an already-destroyed renderer. Keep _midiInput so a
+    // future init() can reattach without the user re-picking.
+    _midiActive = false;
+    if (_midiInput) _midiInput.onmidimessage = null;
+}
+
+function _midiResumeHandler() {
+    // Called from init() — flip the gate first so an in-flight
+    // _midiConnect that lands shortly after this returns wires the
+    // handler too. If _midiInput is already populated from a prior
+    // lifetime, restore the handler immediately.
+    _midiActive = true;
+    if (_midiInput) _midiInput.onmidimessage = _midiOnMessage;
 }
 
 function _midiOnMessage(e) {
     const [status, note, velocity] = e.data;
     const ch = status & 0x0F;
 
-    // Channel filter (-1 = all)
     if (_cfg.midiChannel >= 0 && ch !== _cfg.midiChannel) return;
 
     const cmd = status & 0xF0;
@@ -324,7 +483,6 @@ function _onDrumHit(midiNote, velocity) {
     _synthDrumHit(midiNote, velocity);
     _synthEnsureCtx();
 
-    // Visual feedback: flash the corresponding lane
     const laneIdx = _midiToLaneIdx(midiNote);
     if (laneIdx >= 0) {
         const lane = DRUM_LANES[laneIdx];
@@ -335,7 +493,6 @@ function _onDrumHit(midiNote, velocity) {
         });
     }
 
-    // Hit detection
     if (_cfg.hitDetection) {
         _checkHit(midiNote);
     }
@@ -348,29 +505,71 @@ function _midiUpdateDeviceList() {
     const inputs = [];
     _midiAccess.inputs.forEach(inp => inputs.push(inp));
 
-    sel.innerHTML = '<option value="">None</option>' +
-        inputs.map(inp => {
-            const selected = _midiInput && _midiInput.id === inp.id ? 'selected' : '';
-            return `<option value="${inp.id}" ${selected}>${inp.name}</option>`;
-        }).join('');
+    // Build <option> elements via the DOM API rather than
+    // concatenating an HTML string. MIDI device names come from
+    // attached hardware and can contain characters that would
+    // otherwise inject markup ("<" in a vendor string or a
+    // maliciously-named device) directly into the settings panel.
+    // .value / .textContent escape both fields safely.
+    sel.textContent = '';
+    const noneOpt = document.createElement('option');
+    noneOpt.value = '';
+    noneOpt.textContent = 'None';
+    sel.appendChild(noneOpt);
+    for (const inp of inputs) {
+        const opt = document.createElement('option');
+        opt.value = inp.id;
+        // inp.name can be null / empty across browsers and devices
+        // (Firefox historically, some class-compliant kits); fall
+        // back through manufacturer → id so the dropdown never
+        // literally says "null".
+        opt.textContent = inp.name || inp.manufacturer || inp.id || 'Unknown device';
+        if (_midiInput && _midiInput.id === inp.id) opt.selected = true;
+        sel.appendChild(opt);
+    }
+}
+
+// Shared cleanup for "everything pressed / sounding on the previous
+// MIDI device should stop now." Called from _teardown() on destroy
+// AND from _midiConnect() on device switch, so a "None" pick or
+// device-swap doesn't leave pressed-lane animations drooling out.
+// Also clears transient Learn-mode state — _cfg.learnLane is a
+// pending-remap sentinel; leaving it set across a destroy / device
+// swap would silently swallow the next drum hit on the next init.
+function _releaseAllSounding() {
+    _heldPads.clear();
+    _wrongFlashes.length = 0;
+    _laneFlashes.length = 0;
+    _cfg.learnLane = null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Hit Detection / Accuracy Scoring
+// Hit detection / accuracy scoring (against cached filter-aware arrays)
 // ═══════════════════════════════════════════════════════════════════════
 
 function _checkHit(playedMidi) {
-    const t = highway.getTime();
-    const notes = highway.getNotes();
-    const chords = highway.getChords();
+    const t = _latestTime;
+    const notes = _latestNotes;
+    const chords = _latestChords;
 
-    // Map the played MIDI note to a lane
+    // No chart cached yet (song-change reconnect window, or the
+    // very first frame after init before draw has caught up). Skip
+    // scoring entirely — counting a hit as a miss here would inflate
+    // the miss counter every time the user noodles on the pad during
+    // a song switch, with no matching notes to score against.
+    //
+    // Check both "nullish" AND "empty array" — `![] === false` in
+    // JS, so `if (!notes && !chords)` would miss the reconnect case
+    // where bundle.notes/chords arrive as [] before any song data.
+    const notesEmpty = !notes || notes.length === 0;
+    const chordsEmpty = !chords || chords.length === 0;
+    if (notesEmpty && chordsEmpty) return;
+
     const playedLane = _midiToLaneIdx(playedMidi);
     if (playedLane < 0) return;
 
     let foundHit = false;
 
-    // Check standalone notes
     if (notes) {
         for (const n of notes) {
             if (n.t > t + HIT_TOLERANCE + 0.5) break;
@@ -386,7 +585,6 @@ function _checkHit(playedMidi) {
         }
     }
 
-    // Check chord notes
     if (!foundHit && chords) {
         for (const c of chords) {
             if (c.t > t + HIT_TOLERANCE + 0.5) break;
@@ -416,10 +614,8 @@ function _checkHit(playedMidi) {
     }
 }
 
-function _updateMissedNotes(t) {
+function _updateMissedNotes(t, notes, chords) {
     if (!_cfg.hitDetection) return;
-    const notes = highway.getNotes();
-    const chords = highway.getChords();
     const cutoff = t - HIT_TOLERANCE - 0.05;
 
     if (notes) {
@@ -447,7 +643,6 @@ function _updateMissedNotes(t) {
         }
     }
 
-    // Prune old flashes (>400ms)
     const now = performance.now();
     while (_wrongFlashes.length && now - _wrongFlashes[0].wall > 400) {
         _wrongFlashes.shift();
@@ -455,7 +650,6 @@ function _updateMissedNotes(t) {
     while (_laneFlashes.length && now - _laneFlashes[0].wall > 300) {
         _laneFlashes.shift();
     }
-    // Clear old held pads (>200ms for visual feedback)
     for (const [midi, info] of _heldPads) {
         if (now - info.wall > 200) _heldPads.delete(midi);
     }
@@ -469,85 +663,63 @@ function _resetScoring() {
     _laneFlashes.length = 0;
 }
 
-// ═══════════════════════════════════════════════════════════════════════
-// Auto-detection
-// ═══════════════════════════════════════════════════════════════════════
-
-const DRUMS_PATTERNS = /drums|percussion|drum\s*kit/i;
-
-function isDrumsArrangement() {
-    const info = highway.getSongInfo();
-    if (!info) return false;
-    if (info.arrangement && DRUMS_PATTERNS.test(info.arrangement)) return true;
-    if (info.arrangements) {
-        const idx = info.arrangement_index;
-        const arr = info.arrangements.find(a => a.index === idx);
-        if (arr && DRUMS_PATTERNS.test(arr.name)) return true;
+function _primeLatestSnapshot() {
+    // Fill _latest* from highway's public getters so a MIDI hit that
+    // lands before the first draw() of a new chart has a snapshot
+    // to score against. Getters return unfiltered arrays; once the
+    // first draw runs, _latest* switches to the difficulty-filtered
+    // bundle arrays. Worst case: one hit immediately after song:ready
+    // scores against a note the difficulty slider has hidden.
+    try {
+        if (typeof highway !== 'undefined') {
+            _latestNotes = typeof highway.getNotes === 'function' ? highway.getNotes() : null;
+            _latestChords = typeof highway.getChords === 'function' ? highway.getChords() : null;
+            _latestTime = typeof highway.getTime === 'function' ? highway.getTime() : 0;
+        }
+    } catch (_) {
+        _latestNotes = null;
+        _latestChords = null;
+        _latestTime = 0;
     }
-    return false;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Toggle Buttons
+// Settings panel + gear button
 // ═══════════════════════════════════════════════════════════════════════
 
-function _drumInjectButton() {
+function _injectSettingsGear() {
     const controls = document.getElementById('player-controls');
-    if (!controls || document.getElementById('btn-drums')) return;
+    if (!controls || _settingsGear) return;
 
     const closeBtn = controls.querySelector('button:last-child');
-
-    const btn = document.createElement('button');
-    btn.id = 'btn-drums';
-    btn.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
-    btn.textContent = 'Drums';
-    btn.title = 'Toggle drum highway view';
-    btn.onclick = () => _drumToggle(false);
-    controls.insertBefore(btn, closeBtn);
-
     const gear = document.createElement('button');
     gear.id = 'btn-drums-settings';
-    gear.className = 'px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-500 transition hidden';
-    gear.innerHTML = '&#9881;';
+    gear.className = 'px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
+    gear.type = 'button';
     gear.title = 'Drum settings (MIDI, sounds, scoring)';
+    // Accessible name for screen readers — title alone is announced
+    // inconsistently, and the glyph itself would otherwise surface
+    // as "black gear" or similar ambiguous text.
+    gear.setAttribute('aria-label', 'Drum settings');
+    const glyph = document.createElement('span');
+    glyph.setAttribute('aria-hidden', 'true');
+    glyph.textContent = '⚙';
+    gear.appendChild(glyph);
     gear.onclick = _toggleSettings;
     controls.insertBefore(gear, closeBtn);
+    _settingsGear = gear;
 }
 
-function _drumUpdateButton() {
-    const btn = document.getElementById('btn-drums');
-    const gear = document.getElementById('btn-drums-settings');
-    if (btn) {
-        if (_drumEnabled) {
-            btn.className = 'px-3 py-1.5 bg-red-900/50 rounded-lg text-xs text-red-300 transition';
-            btn.textContent = 'Drums \u2713';
-        } else {
-            btn.className = 'px-3 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
-            btn.textContent = 'Drums';
-        }
-    }
-    if (gear) gear.classList.toggle('hidden', !_drumEnabled);
-}
-
-function _drumToggle(auto) {
-    if (auto && _drumEnabled && !_drumAuto) return;
-    _drumEnabled = !_drumEnabled || auto;
-    _drumAuto = auto && _drumEnabled;
-    _drumUpdateButton();
-
-    if (_drumEnabled) {
-        _drumShow();
-    } else {
-        _drumHide();
+function _removeSettingsGear() {
+    if (_settingsGear) {
+        _settingsGear.remove();
+        _settingsGear = null;
     }
 }
-
-// ═══════════════════════════════════════════════════════════════════════
-// Settings Panel
-// ═══════════════════════════════════════════════════════════════════════
 
 function _toggleSettings() {
     _settingsVisible = !_settingsVisible;
+    if (!_settingsPanel && _settingsVisible) _createSettingsPanel();
     if (_settingsPanel) _settingsPanel.style.display = _settingsVisible ? '' : 'none';
     if (_settingsVisible) {
         _midiInit();
@@ -582,7 +754,6 @@ function _createSettingsPanel() {
             i === 9 ? '' : `<option value="${i}"${_cfg.midiChannel === i ? ' selected' : ''}>${i + 1}</option>`
         ).join('');
 
-    // Build mapping table rows
     const mapRows = DRUM_LANES.map((lane, idx) => {
         const map = _getActiveDrumMap();
         const assigned = Object.entries(map).filter(([_, v]) => v === lane.id).map(([k]) => k).join(', ');
@@ -641,7 +812,6 @@ function _createSettingsPanel() {
     }
     _settingsPanel = panel;
 
-    // Wire up events
     panel.querySelector('#drums-midi-select').onchange = function () {
         _midiConnect(this.value);
         _synthInit();
@@ -661,9 +831,24 @@ function _createSettingsPanel() {
     };
     panel.querySelector('#drums-reset-map').onclick = function () {
         _saveCfg('customMapping', null);
+        // Mapping rows are rendered once during panel construction
+        // from the current _getActiveDrumMap(). Rebuild the panel so
+        // the "assigned" column updates to reflect the defaults.
+        // _removeSettingsPanel forces _settingsVisible=false as part
+        // of tearing the node down; snapshot the prior visibility
+        // state and restore it after the rebuild so the gear toggle
+        // remains in sync — otherwise _settingsVisible and the
+        // actual panel visibility would disagree, and the next gear
+        // click would just flip the flag back to "visible" without
+        // any visual change.
+        const wasSettingsVisible = _settingsVisible;
+        _removeSettingsPanel();
+        _createSettingsPanel();
+        _settingsVisible = wasSettingsVisible;
+        if (wasSettingsVisible && _settingsPanel) _settingsPanel.style.display = '';
+        _midiUpdateDeviceList();
     };
 
-    // Learn buttons
     panel.querySelectorAll('.drums-learn-btn').forEach(btn => {
         btn.onclick = function () {
             const idx = parseInt(this.dataset.lane);
@@ -682,72 +867,7 @@ function _removeSettingsPanel() {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Canvas Management
-// ═══════════════════════════════════════════════════════════════════════
-
-function _drumShow() {
-    const hwCanvas = document.getElementById('highway-canvas') || document.getElementById('highway');
-    if (hwCanvas) hwCanvas.style.display = 'none';
-
-    if (!_drumCanvas) {
-        const player = document.getElementById('player');
-        if (!player) return;
-
-        _drumCanvas = document.createElement('canvas');
-        _drumCanvas.id = 'drum-highway-canvas';
-        _drumCanvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;z-index:5;pointer-events:none;';
-
-        const controls = document.getElementById('player-controls');
-        if (controls) {
-            player.insertBefore(_drumCanvas, controls);
-            controls.style.position = 'relative';
-            controls.style.zIndex = '20';
-        } else {
-            player.appendChild(_drumCanvas);
-        }
-        _drumCtx = _drumCanvas.getContext('2d');
-    }
-
-    _createSettingsPanel();
-    _drumResize();
-    window.addEventListener('resize', _drumResize);
-    if (!_rafId) _rafId = requestAnimationFrame(_drumDraw);
-
-    _midiInit();
-    _synthInit();
-}
-
-function _drumHide() {
-    const hwCanvas = document.getElementById('highway-canvas') || document.getElementById('highway');
-    if (hwCanvas) hwCanvas.style.display = '';
-
-    if (_drumCanvas) {
-        window.removeEventListener('resize', _drumResize);
-        _drumCanvas.remove();
-        _drumCanvas = null;
-        _drumCtx = null;
-    }
-    if (_rafId) {
-        cancelAnimationFrame(_rafId);
-        _rafId = null;
-    }
-    _removeSettingsPanel();
-}
-
-function _drumResize() {
-    if (!_drumCanvas) return;
-    const player = document.getElementById('player');
-    if (!player) return;
-    const dpr = window.devicePixelRatio || 1;
-    _drumCanvas.width = player.clientWidth * dpr;
-    _drumCanvas.height = player.clientHeight * dpr;
-    _drumCanvas.style.width = player.clientWidth + 'px';
-    _drumCanvas.style.height = player.clientHeight + 'px';
-    if (_drumCtx) _drumCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
-}
-
-// ═══════════════════════════════════════════════════════════════════════
-// Round Rect Helper
+// Round rect helper
 // ═══════════════════════════════════════════════════════════════════════
 
 function _roundRect(ctx, x, y, w, h, r) {
@@ -766,16 +886,15 @@ function _roundRect(ctx, x, y, w, h, r) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Lane Geometry (vertical — lanes are columns, notes scroll top to bottom)
+// Lane geometry (vertical — lanes are columns, notes scroll top → bottom)
 // ═══════════════════════════════════════════════════════════════════════
 
-function _computeLaneLayout(W, H) {
+function _computeLaneLayout(W /* , H */) {
     const numLanes = DRUM_LANES.length;
     const padL = 10;
     const padR = 10;
     const availW = W - padL - padR;
 
-    // Kick lane gets extra width
     const kickIdx = DRUM_LANES.findIndex(l => l.id === 'kick');
     const regularW = (availW - KICK_LANE_EXTRA) / numLanes;
     const kickW = regularW + KICK_LANE_EXTRA;
@@ -801,45 +920,43 @@ function _computeLaneLayout(W, H) {
 // ═══════════════════════════════════════════════════════════════════════
 
 function _timeToY(dt, nowLineY, topY) {
-    // dt > 0 means note is in the future (above now line)
-    // dt <= 0 means note has passed (below now line)
     if (dt <= 0) return nowLineY + (-dt / 0.3) * 20;
     const frac = dt / VISIBLE_SECONDS;
     return nowLineY - frac * (nowLineY - topY);
 }
 
-let _debugLogged = false;
-function _drumDraw() {
-    _rafId = requestAnimationFrame(_drumDraw);
+function _draw(notes, chords, t, beats) {
     if (!_drumCanvas || !_drumCtx) return;
 
-    const notes = highway.getNotes();
-    const chords = highway.getChords();
-    const t = highway.getTime();
-
-    if (!_debugLogged && (notes || chords)) {
-        _debugLogged = true;
-        const noteCount = notes ? notes.length : 0;
-        const chordCount = chords ? chords.length : 0;
-        console.log('[Drums] Highway data:', noteCount, 'notes,', chordCount, 'chords');
-        if (notes && notes.length > 0) {
-            const sample = notes.slice(0, 5).map(n => {
-                const midi = noteToMidi(n.s, n.f);
-                const lane = _songNoteToLaneIdx(midi);
-                return `s=${n.s} f=${n.f} midi=${midi} lane=${lane}`;
-            });
-            console.log('[Drums] First notes:', sample);
-        }
-        console.log('[Drums] Song info:', highway.getSongInfo());
-    }
-
-    if (!notes && !chords) return;
+    // Update the MIDI-scoring snapshots FIRST — before the
+    // no-chart-yet early return below. During a song change where
+    // bundle.currentTime advances but notes/chords are still empty
+    // (WS reconnect window), a drum hit between frames would
+    // otherwise score against the PREVIOUS song's cached chart and
+    // its stale t.
+    _latestNotes = notes;
+    _latestChords = chords;
+    _latestTime = t;
 
     const W = _drumCanvas.width / (window.devicePixelRatio || 1);
     const H = _drumCanvas.height / (window.devicePixelRatio || 1);
     const ctx = _drumCtx;
 
-    _updateMissedNotes(t);
+    // No chart yet — paint the plugin's base background and return,
+    // rather than leaving the previous frame's notes + HUD frozen
+    // on screen through a reconnect. Treat both nullish AND empty
+    // arrays as "no chart": bundle.notes / bundle.chords can arrive
+    // as [] before song_info populates them, and `![]` is false in
+    // JS so the plain `!notes && !chords` guard misses that case.
+    const notesEmpty = !notes || notes.length === 0;
+    const chordsEmpty = !chords || chords.length === 0;
+    if (notesEmpty && chordsEmpty) {
+        ctx.fillStyle = '#040408';
+        ctx.fillRect(0, 0, W, H);
+        return;
+    }
+
+    _updateMissedNotes(t, notes, chords);
 
     const nowLineY = H * NOW_LINE_Y_FRAC;
     const topY = 0;
@@ -855,11 +972,9 @@ function _drumDraw() {
         const ll = laneLayout[i];
         const [r, g, b] = ll.lane.color;
 
-        // Subtle lane background stripe
         ctx.fillStyle = _rgbStr(r * 0.06, g * 0.06, b * 0.06, 0.5);
         ctx.fillRect(ll.x, topY, ll.w, nowLineY + 20);
 
-        // Lane border (right edge)
         ctx.strokeStyle = _rgbStr(r * 0.15, g * 0.15, b * 0.15, 0.3);
         ctx.lineWidth = 0.5;
         ctx.beginPath();
@@ -867,7 +982,6 @@ function _drumDraw() {
         ctx.lineTo(ll.x + ll.w, nowLineY + 20);
         ctx.stroke();
 
-        // Lane flash (from MIDI hit)
         for (const flash of _laneFlashes) {
             if (flash.laneIdx === i) {
                 const age = (performance.now() - flash.wall) / 300;
@@ -879,7 +993,7 @@ function _drumDraw() {
         }
     }
 
-    // ── Kick lane separator (left edge of kick column) ──────────────
+    // ── Kick lane separator ─────────────────────────────────────────
     if (kickIdx >= 0) {
         const kickLL = laneLayout[kickIdx];
         ctx.strokeStyle = 'rgba(255,80,80,0.3)';
@@ -892,8 +1006,7 @@ function _drumDraw() {
         ctx.setLineDash([]);
     }
 
-    // ── Beat / measure lines (horizontal) ───────────────────────────
-    const beats = highway.getBeats();
+    // ── Beat / measure lines ────────────────────────────────────────
     if (beats) {
         for (const b of beats) {
             const dt = b.time - t;
@@ -908,7 +1021,7 @@ function _drumDraw() {
         }
     }
 
-    // ── Now line (horizontal) ───────────────────────────────────────
+    // ── Now line ────────────────────────────────────────────────────
     ctx.strokeStyle = 'rgba(255,255,255,0.5)';
     ctx.lineWidth = 2;
     ctx.beginPath();
@@ -916,20 +1029,16 @@ function _drumDraw() {
     ctx.lineTo(laneLayout[laneLayout.length - 1].x + laneLayout[laneLayout.length - 1].w, nowLineY);
     ctx.stroke();
 
-    // ── Scrolling notes ─────────────────────────────────────────────
     _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY, W, H);
 
-    // ── Lane labels (at the bottom, below now line) ─────────────────
     if (_cfg.showLaneLabels) {
         _drawLaneLabels(ctx, laneLayout, nowLineY, H);
     }
 
-    // ── Accuracy HUD ────────────────────────────────────────────────
     if (_cfg.hitDetection && (_hits + _misses) > 0) {
         _drawAccuracyHUD(ctx, W, H);
     }
 
-    // ── MIDI status indicator ───────────────────────────────────────
     if (_midiInput) {
         ctx.fillStyle = '#22cc66';
         ctx.beginPath();
@@ -943,9 +1052,7 @@ function _drumDraw() {
     }
 }
 
-// ── Draw Scrolling Notes (vertical — notes fall top to bottom) ──────
-
-function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY, W, H) {
+function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY /* , W, H */) {
     const allNotes = [];
 
     if (notes) {
@@ -976,12 +1083,10 @@ function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY, 
         const dt = n.t - t;
         const y = _timeToY(dt, nowLineY, topY);
 
-        // Skip if off-screen
         if (y < -20 || y > nowLineY + 30) continue;
 
         const isActive = Math.abs(dt) < 0.03;
 
-        // Determine color
         const nk = _noteKey(n.t, n.midi);
         let useHitColor = false, useMissColor = false;
         if (_cfg.hitDetection) {
@@ -997,15 +1102,12 @@ function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY, 
         const cx = ll.centerX;
 
         if (lane.id === 'kick') {
-            // ── Kick: full-height bar spanning all lanes ────────────
-            const barW = ll.w * 0.6 * velFactor;
             const barH = Math.max(4, 8 * velFactor);
             const firstLane = laneLayout[0];
             const lastLane = laneLayout[laneLayout.length - 1];
             const fullLeft = firstLane.x;
             const fullRight = lastLane.x + lastLane.w;
 
-            // Full-width bar across all lanes
             if (!useMissColor) {
                 const glowAlpha = isActive ? 0.4 : 0.15;
                 for (let i = 1; i >= 0; i--) {
@@ -1018,17 +1120,14 @@ function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY, 
             ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.2 : 0.5);
             ctx.fillRect(fullLeft, y - barH / 2, fullRight - fullLeft, barH);
 
-            // Brighter bar in the kick column
             ctx.fillStyle = _rgbStr(cr, cg, cb, useMissColor ? 0.3 : 0.9);
             ctx.fillRect(ll.x + 2, y - barH / 2, ll.w - 4, barH);
 
-            // Active flash
             if (isActive && !useMissColor) {
                 ctx.fillStyle = _rgbStr(cr, cg, cb, 0.12);
                 ctx.fillRect(fullLeft, nowLineY - 5, fullRight - fullLeft, 10);
             }
         } else if (lane.symbol === 'diamond') {
-            // ── Cymbal: diamond shape ───────────────────────────────
             const size = (ll.w * 0.25) * velFactor;
 
             if (!useMissColor) {
@@ -1057,7 +1156,6 @@ function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY, 
             ctx.closePath();
             ctx.fill();
         } else if (lane.id === 'hihat') {
-            // ── Hi-hat: X shapes with variation ─────────────────────
             const size = (ll.w * 0.22) * velFactor;
             const isOpen = n.midi === 46;
             const isPedal = n.midi === 44;
@@ -1097,7 +1195,6 @@ function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY, 
                 ctx.stroke();
             }
         } else {
-            // ── Toms / Snare: circles ───────────────────────────────
             const radius = (ll.w * 0.25) * velFactor;
 
             if (!useMissColor) {
@@ -1131,17 +1228,13 @@ function _drawScrollingNotes(ctx, notes, chords, t, laneLayout, nowLineY, topY, 
     }
 }
 
-// ── Lane Labels (at the bottom of each column) ─────────────────────
-
 function _drawLaneLabels(ctx, laneLayout, nowLineY, H) {
     const labelY = nowLineY + 8;
     const labelH = H - labelY;
 
-    // Label background strip
     ctx.fillStyle = 'rgba(8,8,20,0.85)';
     ctx.fillRect(0, labelY, laneLayout[laneLayout.length - 1].x + laneLayout[laneLayout.length - 1].w + 10, labelH);
 
-    // Top border
     ctx.strokeStyle = 'rgba(255,255,255,0.1)';
     ctx.lineWidth = 1;
     ctx.beginPath();
@@ -1160,9 +1253,7 @@ function _drawLaneLabels(ctx, laneLayout, nowLineY, H) {
     }
 }
 
-// ── Accuracy HUD ────────────────────────────────────────────────────
-
-function _drawAccuracyHUD(ctx, W, H) {
+function _drawAccuracyHUD(ctx, W /* , H */) {
     const total = _hits + _misses;
     if (total === 0) return;
 
@@ -1187,50 +1278,213 @@ function _drawAccuracyHUD(ctx, W, H) {
 }
 
 // ═══════════════════════════════════════════════════════════════════════
-// Hook into playSong
+// Lifecycle helpers
 // ═══════════════════════════════════════════════════════════════════════
 
-function _drumOnSongLoad() {
-    _drumInjectButton();
-    _resetScoring();
+function _createOverlayCanvas() {
+    const player = document.getElementById('player');
+    if (!player) return null;
 
-    setTimeout(() => {
-        if (isDrumsArrangement()) {
-            _drumToggle(true);
-        } else if (_drumAuto) {
-            _drumEnabled = false;
-            _drumAuto = false;
-            _drumHide();
-            _drumUpdateButton();
-        }
-    }, 500);
+    const canvas = document.createElement('canvas');
+    canvas.id = 'drum-highway-canvas';
+    canvas.style.cssText = 'position:absolute;top:0;left:0;width:100%;height:100%;z-index:5;pointer-events:none;';
+
+    const controls = document.getElementById('player-controls');
+    if (controls) {
+        player.insertBefore(canvas, controls);
+        // Snapshot prior inline values so destroy() can restore them.
+        // An empty string here means the rule lives in a stylesheet
+        // rather than inline; assigning '' back on restore removes
+        // our override without touching the stylesheet rule.
+        _prevControlsPosition = controls.style.position;
+        _prevControlsZIndex = controls.style.zIndex;
+        _controlsStyleTouched = true;
+        controls.style.position = 'relative';
+        controls.style.zIndex = '20';
+    } else {
+        player.appendChild(canvas);
+    }
+    return canvas;
 }
 
-const _origPlaySong = window.playSong;
-window.playSong = async function (filename, arrangement) {
-    if (_drumAuto) {
-        _drumEnabled = false;
-        _drumAuto = false;
-        _drumHide();
+function _restoreControlsStyle() {
+    if (!_controlsStyleTouched) return;
+    const controls = document.getElementById('player-controls');
+    if (controls) {
+        controls.style.position = _prevControlsPosition;
+        controls.style.zIndex = _prevControlsZIndex;
     }
-    await _origPlaySong(filename, arrangement);
-    _drumOnSongLoad();
+    _controlsStyleTouched = false;
+    _prevControlsPosition = '';
+    _prevControlsZIndex = '';
+}
+
+function _applyCanvasDims(canvas) {
+    // Measure #player in CSS px; see the piano plugin's equivalent
+    // comment for why we ignore the w/h passed to resize() in favour
+    // of re-measuring the element rect.
+    if (!canvas) return;
+    const player = document.getElementById('player');
+    if (!player) return;
+    const w = player.clientWidth;
+    const h = player.clientHeight;
+    if (!w || !h) return;
+    const dpr = window.devicePixelRatio || 1;
+    canvas.width = w * dpr;
+    canvas.height = h * dpr;
+    canvas.style.width = w + 'px';
+    canvas.style.height = h + 'px';
+    if (_drumCtx) _drumCtx.setTransform(dpr, 0, 0, dpr, 0, 0);
+}
+
+// ═══════════════════════════════════════════════════════════════════════
+// Factory — slopsmith#36 setRenderer contract
+// ═══════════════════════════════════════════════════════════════════════
+
+// Wipes scoring + flash buffers + _heldPads so the next chart
+// doesn't inherit stale state. Critical for Auto-mode
+// Drums-to-Drums transitions (drum renderer stays selected across
+// the arrangement switch). Module-scope so the song:ready listener
+// wired in init() is a stable function reference across factory
+// instances.
+function _resetForNewChart() {
+    _resetScoring();
+    _heldPads.clear();
+    _primeLatestSnapshot();
+}
+
+// Module-scope handlers. Previously these were per-factory closures,
+// which meant a defensive-teardown running inside a NEW factory's
+// init() was calling removeEventListener / slopsmith.off with its
+// OWN refs, which never matched the OLD factory's registered refs —
+// so listeners leaked and every event fired the handler stack twice.
+// Module-scope refs keep attach/detach symmetric. The single-instance
+// assumption at the top of the file covers multi-factory correctness;
+// Wave C splitscreen adoption will re-factor state into closures and
+// at that point we'll need per-panel handlers too.
+function _onWinResize() {
+    _applyCanvasDims(_drumCanvas);
+}
+function _onSongReady() {
+    _resetForNewChart();
+}
+
+function createFactory() {
+    let _isReady = false;
+
+    return {
+        init(canvas /* , bundle */) {
+            // Defensive teardown in case a prior init wasn't paired
+            // with destroy. Mirror destroy()'s cleanup exactly —
+            // including restoreCanvas=true. If we skipped the
+            // restore, the prior lifetime's highway canvas would
+            // stay `display:none` going into the fresh capture
+            // below, poisoning `_prevHighwayDisplay` with "none" so
+            // a later destroy() would re-hide the canvas permanently.
+            if (_drumCanvas || _isReady) {
+                window.removeEventListener('resize', _onWinResize);
+                if (window.slopsmith) window.slopsmith.off?.('song:ready', _onSongReady);
+                _midiPauseHandler();
+                _teardown(/* restoreCanvas */ true);
+                _isReady = false;
+            }
+
+            _highwayCanvas = canvas;
+            _prevHighwayDisplay = canvas ? canvas.style.display : '';
+
+            _drumCanvas = _createOverlayCanvas();
+            if (!_drumCanvas) {
+                console.warn('[Drums] init: #player container missing; aborting');
+                return;
+            }
+            _drumCtx = _drumCanvas.getContext('2d');
+            if (!_drumCtx) {
+                // 2D context unavailable — tear down our freshly
+                // built overlay, restore any controls-style override,
+                // and leave the highway canvas visible as a fallback.
+                // Without this abort we'd hide the highway below and
+                // every draw() would silently no-op against a null
+                // ctx, leaving a blank player.
+                console.warn('[Drums] init: getContext("2d") returned null; aborting');
+                _drumCanvas.remove();
+                _drumCanvas = null;
+                _highwayCanvas = null;
+                _prevHighwayDisplay = '';
+                _restoreControlsStyle();
+                return;
+            }
+
+            if (_highwayCanvas) _highwayCanvas.style.display = 'none';
+
+            _injectSettingsGear();
+            _applyCanvasDims(_drumCanvas);
+            window.addEventListener('resize', _onWinResize);
+            // Optional-chain .on as well as the receiver: older
+            // slopsmith cores (pre-Wave A) expose window.slopsmith
+            // as a plain object without the on/off bus, and a bare
+            // .on(...) call there would throw.
+            window.slopsmith?.on?.('song:ready', _onSongReady);
+
+            _resetForNewChart();
+
+            _midiInit();
+            _synthInit();
+            _midiResumeHandler();
+
+            _isReady = true;
+        },
+        draw(bundle) {
+            if (!_isReady || !bundle) return;
+            _draw(bundle.notes, bundle.chords, bundle.currentTime, bundle.beats);
+        },
+        resize(/* w, h */) {
+            if (!_isReady) return;
+            _applyCanvasDims(_drumCanvas);
+        },
+        destroy() {
+            _isReady = false;
+            window.removeEventListener('resize', _onWinResize);
+            if (window.slopsmith) window.slopsmith.off?.('song:ready', _onSongReady);
+            _midiPauseHandler();
+            _teardown(/* restoreCanvas */ true);
+        },
+    };
+
+    function _teardown(restoreCanvas) {
+        if (_drumCanvas) {
+            _drumCanvas.remove();
+            _drumCanvas = null;
+            _drumCtx = null;
+        }
+        _removeSettingsPanel();
+        _removeSettingsGear();
+        _restoreControlsStyle();
+
+        _releaseAllSounding();
+
+        if (restoreCanvas && _highwayCanvas) {
+            _highwayCanvas.style.display = _prevHighwayDisplay;
+            _highwayCanvas = null;
+            _prevHighwayDisplay = '';
+        }
+
+        _latestNotes = null;
+        _latestChords = null;
+        _latestTime = 0;
+    }
+}
+
+createFactory.matchesArrangement = function (songInfo) {
+    if (!songInfo) return false;
+    if (songInfo.arrangement && DRUMS_PATTERNS.test(songInfo.arrangement)) return true;
+    if (Array.isArray(songInfo.arrangements)) {
+        const idx = songInfo.arrangement_index;
+        const arr = songInfo.arrangements.find(a => a.index === idx);
+        if (arr && DRUMS_PATTERNS.test(arr.name)) return true;
+    }
+    return false;
 };
 
-const _origReconnect = highway.reconnect.bind(highway);
-highway.reconnect = function (filename, arrangement) {
-    _resetScoring();
-    _origReconnect(filename, arrangement);
-    setTimeout(() => {
-        if (isDrumsArrangement()) {
-            if (!_drumEnabled) _drumToggle(true);
-        } else if (_drumAuto) {
-            _drumEnabled = false;
-            _drumAuto = false;
-            _drumHide();
-            _drumUpdateButton();
-        }
-    }, 500);
-};
+window.slopsmithViz_drums = createFactory;
 
 })();
