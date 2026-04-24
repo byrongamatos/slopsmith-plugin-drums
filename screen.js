@@ -61,20 +61,80 @@ function _readStore(key) {
     try { return localStorage.getItem(key); } catch (_) { return null; }
 }
 
+// Numeric cfg normaliser — parseFloat/parseInt return NaN on junk
+// like "foo" or "", which would propagate into AudioParam.gain.value
+// (breaks playback) or MIDI channel filtering (misroutes events).
+// Clamp to [min, max] when provided and fall back to the default on
+// any non-finite result.
+function _readNum(key, fallback, min, max) {
+    const raw = _readStore(key);
+    if (raw == null) return fallback;
+    const n = parseFloat(raw);
+    if (!Number.isFinite(n)) return fallback;
+    if (min !== undefined && n < min) return min;
+    if (max !== undefined && n > max) return max;
+    return n;
+}
+
+// Lane ids declared here so the customMapping validator below can
+// shape-check persisted user mappings. The full DRUM_LANES table
+// appears further down (with colors, symbols, MIDI-note lists); the
+// ids are duplicated here once because _cfg initialises before the
+// DRUM_LANES block runs.
+const _VALID_LANE_IDS = new Set([
+    'hihat', 'snare', 'tom1', 'tom2', 'tom3', 'crash', 'ride', 'kick',
+]);
+
+// Validate a customMapping object loaded from localStorage. Storage
+// is user-controlled (manual edits, another plugin, synced profiles),
+// so parsing the raw JSON is NOT enough — we need to reject
+// non-object / array inputs, strip __proto__ / constructor /
+// prototype keys to block prototype-pollution, and drop any
+// (key, value) pair that isn't (MIDI note 0-127, known lane id).
+// Returns a clean null-prototype object, or null if nothing survives.
+function _validateCustomMapping(raw) {
+    if (!raw || typeof raw !== 'object' || Array.isArray(raw)) return null;
+    const clean = Object.create(null);
+    let hasEntries = false;
+    for (const key of Object.keys(raw)) {
+        if (key === '__proto__' || key === 'constructor' || key === 'prototype') continue;
+        const midi = parseInt(key, 10);
+        if (!Number.isFinite(midi) || midi < 0 || midi > 127) continue;
+        const val = raw[key];
+        if (typeof val !== 'string' || !_VALID_LANE_IDS.has(val)) continue;
+        clean[midi] = val;
+        hasEntries = true;
+    }
+    return hasEntries ? clean : null;
+}
+
 const _cfg = {
     midiInputId:    _readStore(STORE_KEYS.midiInputId) || '',
-    synthVolume:    parseFloat(_readStore(STORE_KEYS.synthVolume) || '0.7'),
-    midiChannel:    parseInt(_readStore(STORE_KEYS.midiChannel) || '-1'),  // -1 = all, 9 = ch10
+    synthVolume:    _readNum(STORE_KEYS.synthVolume, 0.7, 0, 1),
+    // -1 = all, 0..15 are the 16 MIDI channels (9 = "ch10" Drums)
+    midiChannel:    Math.round(_readNum(STORE_KEYS.midiChannel, -1, -1, 15)),
     hitDetection:   _readStore(STORE_KEYS.hitDetection) === 'true',
     showLaneLabels: _readStore(STORE_KEYS.showLaneLabels) !== 'false',
     customMapping:  (function () {
-        try { return JSON.parse(_readStore(STORE_KEYS.customMapping) || 'null'); }
-        catch (_) { return null; }
+        try {
+            const raw = JSON.parse(_readStore(STORE_KEYS.customMapping) || 'null');
+            return _validateCustomMapping(raw);
+        } catch (_) { return null; }
     })(),
     learnLane:      null,  // transient: which lane is in learn mode
 };
 
 function _saveCfg(key, val) {
+    // Apply the same shape validation the _cfg initialiser uses so
+    // anything we write to localStorage is also trustworthy on next
+    // load. Belt-and-suspenders — Learn-mode builds its map from
+    // Object.assign({}, _getActiveDrumMap()) + a fresh midi+laneId
+    // pair, so input is already well-formed, but routing through
+    // the validator means any future caller can't accidentally
+    // persist garbage.
+    if (key === 'customMapping' && val !== null) {
+        val = _validateCustomMapping(val);
+    }
     _cfg[key] = val;
     const storeKey = STORE_KEYS[key];
     if (!storeKey) return;
@@ -459,7 +519,11 @@ function _midiUpdateDeviceList() {
     for (const inp of inputs) {
         const opt = document.createElement('option');
         opt.value = inp.id;
-        opt.textContent = inp.name;
+        // inp.name can be null / empty across browsers and devices
+        // (Firefox historically, some class-compliant kits); fall
+        // back through manufacturer → id so the dropdown never
+        // literally says "null".
+        opt.textContent = inp.name || inp.manufacturer || inp.id || 'Unknown device';
         if (_midiInput && _midiInput.id === inp.id) opt.selected = true;
         sel.appendChild(opt);
     }
