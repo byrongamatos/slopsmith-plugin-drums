@@ -493,7 +493,13 @@ function _checkHit(playedMidi) {
     // scoring entirely — counting a hit as a miss here would inflate
     // the miss counter every time the user noodles on the pad during
     // a song switch, with no matching notes to score against.
-    if (!notes && !chords) return;
+    //
+    // Check both "nullish" AND "empty array" — `![] === false` in
+    // JS, so `if (!notes && !chords)` would miss the reconnect case
+    // where bundle.notes/chords arrive as [] before any song data.
+    const notesEmpty = !notes || notes.length === 0;
+    const chordsEmpty = !chords || chords.length === 0;
+    if (notesEmpty && chordsEmpty) return;
 
     const playedLane = _midiToLaneIdx(playedMidi);
     if (playedLane < 0) return;
@@ -874,8 +880,13 @@ function _draw(notes, chords, t, beats) {
 
     // No chart yet — paint the plugin's base background and return,
     // rather than leaving the previous frame's notes + HUD frozen
-    // on screen through a reconnect.
-    if (!notes && !chords) {
+    // on screen through a reconnect. Treat both nullish AND empty
+    // arrays as "no chart": bundle.notes / bundle.chords can arrive
+    // as [] before song_info populates them, and `![]` is false in
+    // JS so the plain `!notes && !chords` guard misses that case.
+    const notesEmpty = !notes || notes.length === 0;
+    const chordsEmpty = !chords || chords.length === 0;
+    if (notesEmpty && chordsEmpty) {
         ctx.fillStyle = '#040408';
         ctx.fillRect(0, 0, W, H);
         return;
