@@ -22,7 +22,12 @@
 // Config
 // ═══════════════════════════════════════════════════════════════════════
 
-const DRUMS_PATTERNS = /drums|percussion|drum\s*kit/i;
+// Word-boundary match so unrelated arrangement names don't trigger
+// Auto-drums via a substring hit — e.g. "Drumstick" (hypothetical)
+// must NOT match "drums". The \b anchors still catch standard
+// Rocksmith arrangement labels cleanly: "Drums", "Drum Kit",
+// "Percussion", "Electronic Drums", etc.
+const DRUMS_PATTERNS = /\b(?:drums|percussion|drum\s*kit)\b/i;
 const VISIBLE_SECONDS = 3.0;
 const NOW_LINE_Y_FRAC = 0.85;
 const LANE_PAD = 1;
@@ -30,25 +35,52 @@ const KICK_LANE_EXTRA = 20;
 const HIT_TOLERANCE = 0.05;        // seconds (drums need tighter timing than piano)
 
 // ── Persisted settings ───────────────────────────────────────────────
+//
+// Explicit map from in-memory property name to localStorage key so
+// read and write always agree. The previous code read from
+// hand-picked keys but wrote to snake-cased derivatives ('midiChannel'
+// → 'drums_midi_channel' not 'drums_midi_ch'), silently losing saves
+// on every reload.
+
+const STORE_KEYS = {
+    midiInputId:    'drums_midi_input',
+    synthVolume:    'drums_synth_vol',
+    midiChannel:    'drums_midi_ch',
+    hitDetection:   'drums_hit_detect',
+    showLaneLabels: 'drums_lane_labels',
+    customMapping:  'drums_custom_map',
+};
+
+// Safe localStorage reader — getItem can throw SecurityError in
+// sandboxed iframes, under Safari on file://, or when storage is
+// disabled for the origin. An unguarded throw during the _cfg
+// initialiser would abort the IIFE and the plugin would never
+// register its setRenderer factory. Return null on failure so the
+// `|| default` fallthrough below still produces a usable value.
+function _readStore(key) {
+    try { return localStorage.getItem(key); } catch (_) { return null; }
+}
 
 const _cfg = {
-    midiInputId:   localStorage.getItem('drums_midi_input') || '',
-    synthVolume:   parseFloat(localStorage.getItem('drums_synth_vol') || '0.7'),
-    midiChannel:   parseInt(localStorage.getItem('drums_midi_ch') || '-1'),  // -1 = all, 9 = ch10
-    hitDetection:  localStorage.getItem('drums_hit_detect') === 'true',
-    showLaneLabels: localStorage.getItem('drums_lane_labels') !== 'false',
-    customMapping: JSON.parse(localStorage.getItem('drums_custom_map') || 'null'),
-    learnLane:     null,  // transient: which lane is in learn mode
+    midiInputId:    _readStore(STORE_KEYS.midiInputId) || '',
+    synthVolume:    parseFloat(_readStore(STORE_KEYS.synthVolume) || '0.7'),
+    midiChannel:    parseInt(_readStore(STORE_KEYS.midiChannel) || '-1'),  // -1 = all, 9 = ch10
+    hitDetection:   _readStore(STORE_KEYS.hitDetection) === 'true',
+    showLaneLabels: _readStore(STORE_KEYS.showLaneLabels) !== 'false',
+    customMapping:  (function () {
+        try { return JSON.parse(_readStore(STORE_KEYS.customMapping) || 'null'); }
+        catch (_) { return null; }
+    })(),
+    learnLane:      null,  // transient: which lane is in learn mode
 };
 
 function _saveCfg(key, val) {
     _cfg[key] = val;
-    const storeKey = 'drums_' + key.replace(/[A-Z]/g, c => '_' + c.toLowerCase());
-    if (typeof val === 'object' && val !== null) {
-        localStorage.setItem(storeKey, JSON.stringify(val));
-    } else {
-        localStorage.setItem(storeKey, String(val));
-    }
+    const storeKey = STORE_KEYS[key];
+    if (!storeKey) return;
+    const serialised = typeof val === 'object' && val !== null
+        ? JSON.stringify(val) : String(val);
+    try { localStorage.setItem(storeKey, serialised); } catch (_) {}
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -58,6 +90,15 @@ function _saveCfg(key, val) {
 // ── MIDI input ────────────────────────────────────────────────────────
 let _midiAccess = null;
 let _midiInput = null;
+// Gates onmidimessage wiring. init() flips true via _midiResumeHandler
+// and destroy() flips false via _midiPauseHandler. Because _midiInit
+// is async, a requestMIDIAccess promise begun in init() can resolve
+// AFTER destroy() has already run — the resulting _midiAutoConnect
+// would otherwise assign `_midiInput.onmidimessage = _midiOnMessage`
+// on a no-longer-visible renderer, bringing synth + scoring back in
+// the background. Every callsite that would attach the handler
+// consults this flag first.
+let _midiActive = false;
 const _heldPads = new Map();       // midi note -> {velocity, wall}
 
 // ── Synth ─────────────────────────────────────────────────────────────
@@ -76,6 +117,13 @@ let _settingsGear = null;
 let _settingsVisible = false;
 let _highwayCanvas = null;
 let _prevHighwayDisplay = '';
+// #player-controls inline-style snapshot. _createOverlayCanvas
+// nudges position + zIndex so the controls strip stays above the
+// overlay; destroy() must restore those verbatim so the inline
+// override doesn't leak into whichever renderer comes next.
+let _controlsStyleTouched = false;
+let _prevControlsPosition = '';
+let _prevControlsZIndex = '';
 
 let _hits = 0, _misses = 0, _streak = 0, _bestStreak = 0;
 const _hitNoteKeys = new Set();
@@ -262,6 +310,11 @@ async function _midiInit() {
         _midiAccess = await navigator.requestMIDIAccess({ sysex: false });
         _midiAccess.onstatechange = () => _midiUpdateDeviceList();
         _midiAutoConnect();
+        // Populate the settings panel's MIDI <select> even when
+        // _midiAutoConnect bailed early (no devices, or user's saved
+        // "None" opt-out). Without this the dropdown stays stuck on
+        // the initial "None" option until a device statechange fires.
+        _midiUpdateDeviceList();
     } catch (e) {
         console.warn('[Drums] MIDI access denied:', e);
     }
@@ -273,8 +326,15 @@ function _midiAutoConnect() {
     _midiAccess.inputs.forEach(inp => inputs.push(inp));
     if (!inputs.length) return;
 
-    const saved = _cfg.midiInputId;
-    const target = inputs.find(i => i.id === saved) || inputs[0];
+    // Distinguish "never picked a device" from "explicitly picked
+    // None". _readStore returns null for the never-set case (and
+    // for storage-disabled contexts) and '' for an explicit-None
+    // save via _midiConnect. Only respect the explicit-None
+    // sentinel; fall through to inputs[0] on the null branch.
+    const raw = _readStore(STORE_KEYS.midiInputId);
+    if (raw === '') return;
+
+    const target = inputs.find(i => i.id === raw) || inputs[0];
     _midiConnect(target.id);
 }
 
@@ -282,12 +342,30 @@ function _midiConnect(id) {
     if (_midiInput) _midiInput.onmidimessage = null;
     _midiInput = null;
 
-    if (!_midiAccess) return;
+    // Release anything currently sounding / held on the OLD device
+    // before we swap. Drum notes are short (queueWaveTable duration
+    // 0.5s) so hung tones are less likely than for piano, but
+    // _heldPads drives on-screen lane pressed state and would
+    // otherwise keep the prior hit animating after a device swap.
+    _releaseAllSounding();
+
+    // Persist regardless of match. Empty id is the explicit "None"
+    // option and must be saved so _midiAutoConnect respects the
+    // opt-out on next init instead of auto-picking inputs[0] again.
+    _saveCfg('midiInputId', id || '');
+
+    if (!id || !_midiAccess) {
+        _midiUpdateDeviceList();
+        return;
+    }
     _midiAccess.inputs.forEach(inp => {
         if (inp.id === id) {
             _midiInput = inp;
-            _midiInput.onmidimessage = _midiOnMessage;
-            _saveCfg('midiInputId', id);
+            // Wire the handler only when the renderer is active.
+            // A late _midiConnect from an async _midiInit that
+            // resolved post-destroy would otherwise re-enable
+            // scoring / synth in the background.
+            if (_midiActive) _midiInput.onmidimessage = _midiOnMessage;
         }
     });
     _midiUpdateDeviceList();
@@ -296,15 +374,21 @@ function _midiConnect(id) {
 function _midiPauseHandler() {
     // Called from destroy() — detach the message handler so the
     // connected kit stops firing _onDrumHit into a plugin no longer
-    // visible. Keep _midiInput so a future init() can reattach
-    // without the user having to re-pick their device.
+    // visible. Flipping _midiActive BEFORE the detach also prevents
+    // a late-resolving _midiConnect (from an in-flight _midiInit
+    // started in the most recent init()) from re-wiring the handler
+    // on an already-destroyed renderer. Keep _midiInput so a
+    // future init() can reattach without the user re-picking.
+    _midiActive = false;
     if (_midiInput) _midiInput.onmidimessage = null;
 }
 
 function _midiResumeHandler() {
-    // Called from init() — restore the handler if MIDI was connected
-    // in a previous drum lifetime. No-op when _midiInput is null;
-    // _midiInit + _midiAutoConnect will wire up afresh.
+    // Called from init() — flip the gate first so an in-flight
+    // _midiConnect that lands shortly after this returns wires the
+    // handler too. If _midiInput is already populated from a prior
+    // lifetime, restore the handler immediately.
+    _midiActive = true;
     if (_midiInput) _midiInput.onmidimessage = _midiOnMessage;
 }
 
@@ -361,11 +445,34 @@ function _midiUpdateDeviceList() {
     const inputs = [];
     _midiAccess.inputs.forEach(inp => inputs.push(inp));
 
-    sel.innerHTML = '<option value="">None</option>' +
-        inputs.map(inp => {
-            const selected = _midiInput && _midiInput.id === inp.id ? 'selected' : '';
-            return `<option value="${inp.id}" ${selected}>${inp.name}</option>`;
-        }).join('');
+    // Build <option> elements via the DOM API rather than
+    // concatenating an HTML string. MIDI device names come from
+    // attached hardware and can contain characters that would
+    // otherwise inject markup ("<" in a vendor string or a
+    // maliciously-named device) directly into the settings panel.
+    // .value / .textContent escape both fields safely.
+    sel.textContent = '';
+    const noneOpt = document.createElement('option');
+    noneOpt.value = '';
+    noneOpt.textContent = 'None';
+    sel.appendChild(noneOpt);
+    for (const inp of inputs) {
+        const opt = document.createElement('option');
+        opt.value = inp.id;
+        opt.textContent = inp.name;
+        if (_midiInput && _midiInput.id === inp.id) opt.selected = true;
+        sel.appendChild(opt);
+    }
+}
+
+// Shared cleanup for "everything pressed / sounding on the previous
+// MIDI device should stop now." Called from _teardown() on destroy
+// AND from _midiConnect() on device switch, so a "None" pick or
+// device-swap doesn't leave pressed-lane animations drooling out.
+function _releaseAllSounding() {
+    _heldPads.clear();
+    _wrongFlashes.length = 0;
+    _laneFlashes.length = 0;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -507,8 +614,16 @@ function _injectSettingsGear() {
     const gear = document.createElement('button');
     gear.id = 'btn-drums-settings';
     gear.className = 'px-2 py-1.5 bg-dark-600 hover:bg-dark-500 rounded-lg text-xs text-gray-400 transition';
-    gear.innerHTML = '&#9881;';
+    gear.type = 'button';
     gear.title = 'Drum settings (MIDI, sounds, scoring)';
+    // Accessible name for screen readers — title alone is announced
+    // inconsistently, and the glyph itself would otherwise surface
+    // as "black gear" or similar ambiguous text.
+    gear.setAttribute('aria-label', 'Drum settings');
+    const glyph = document.createElement('span');
+    glyph.setAttribute('aria-hidden', 'true');
+    glyph.textContent = '⚙';
+    gear.appendChild(glyph);
     gear.onclick = _toggleSettings;
     controls.insertBefore(gear, closeBtn);
     _settingsGear = gear;
@@ -635,6 +750,15 @@ function _createSettingsPanel() {
     };
     panel.querySelector('#drums-reset-map').onclick = function () {
         _saveCfg('customMapping', null);
+        // Mapping rows are rendered once during panel construction
+        // from the current _getActiveDrumMap(). Rebuild the panel so
+        // the "assigned" column updates to reflect the defaults —
+        // without this the table would keep showing the old custom
+        // mapping until the panel was closed and reopened.
+        _removeSettingsPanel();
+        _createSettingsPanel();
+        if (_settingsPanel) _settingsPanel.style.display = '';
+        _midiUpdateDeviceList();
     };
 
     panel.querySelectorAll('.drums-learn-btn').forEach(btn => {
@@ -715,8 +839,13 @@ function _timeToY(dt, nowLineY, topY) {
 
 function _draw(notes, chords, t, beats) {
     if (!_drumCanvas || !_drumCtx) return;
-    if (!notes && !chords) return;
 
+    // Update the MIDI-scoring snapshots FIRST — before the
+    // no-chart-yet early return below. During a song change where
+    // bundle.currentTime advances but notes/chords are still empty
+    // (WS reconnect window), a drum hit between frames would
+    // otherwise score against the PREVIOUS song's cached chart and
+    // its stale t.
     _latestNotes = notes;
     _latestChords = chords;
     _latestTime = t;
@@ -724,6 +853,15 @@ function _draw(notes, chords, t, beats) {
     const W = _drumCanvas.width / (window.devicePixelRatio || 1);
     const H = _drumCanvas.height / (window.devicePixelRatio || 1);
     const ctx = _drumCtx;
+
+    // No chart yet — paint the plugin's base background and return,
+    // rather than leaving the previous frame's notes + HUD frozen
+    // on screen through a reconnect.
+    if (!notes && !chords) {
+        ctx.fillStyle = '#040408';
+        ctx.fillRect(0, 0, W, H);
+        return;
+    }
 
     _updateMissedNotes(t, notes, chords);
 
@@ -1061,12 +1199,31 @@ function _createOverlayCanvas() {
     const controls = document.getElementById('player-controls');
     if (controls) {
         player.insertBefore(canvas, controls);
+        // Snapshot prior inline values so destroy() can restore them.
+        // An empty string here means the rule lives in a stylesheet
+        // rather than inline; assigning '' back on restore removes
+        // our override without touching the stylesheet rule.
+        _prevControlsPosition = controls.style.position;
+        _prevControlsZIndex = controls.style.zIndex;
+        _controlsStyleTouched = true;
         controls.style.position = 'relative';
         controls.style.zIndex = '20';
     } else {
         player.appendChild(canvas);
     }
     return canvas;
+}
+
+function _restoreControlsStyle() {
+    if (!_controlsStyleTouched) return;
+    const controls = document.getElementById('player-controls');
+    if (controls) {
+        controls.style.position = _prevControlsPosition;
+        controls.style.zIndex = _prevControlsZIndex;
+    }
+    _controlsStyleTouched = false;
+    _prevControlsPosition = '';
+    _prevControlsZIndex = '';
 }
 
 function _applyCanvasDims(canvas) {
@@ -1091,25 +1248,52 @@ function _applyCanvasDims(canvas) {
 // Factory — slopsmith#36 setRenderer contract
 // ═══════════════════════════════════════════════════════════════════════
 
+// Wipes scoring + flash buffers + _heldPads so the next chart
+// doesn't inherit stale state. Critical for Auto-mode
+// Drums-to-Drums transitions (drum renderer stays selected across
+// the arrangement switch). Module-scope so the song:ready listener
+// wired in init() is a stable function reference across factory
+// instances.
+function _resetForNewChart() {
+    _resetScoring();
+    _heldPads.clear();
+    _primeLatestSnapshot();
+}
+
+// Module-scope handlers. Previously these were per-factory closures,
+// which meant a defensive-teardown running inside a NEW factory's
+// init() was calling removeEventListener / slopsmith.off with its
+// OWN refs, which never matched the OLD factory's registered refs —
+// so listeners leaked and every event fired the handler stack twice.
+// Module-scope refs keep attach/detach symmetric. The single-instance
+// assumption at the top of the file covers multi-factory correctness;
+// Wave C splitscreen adoption will re-factor state into closures and
+// at that point we'll need per-panel handlers too.
+function _onWinResize() {
+    _applyCanvasDims(_drumCanvas);
+}
+function _onSongReady() {
+    _resetForNewChart();
+}
+
 function createFactory() {
     let _isReady = false;
-    const _onWinResize = () => _applyCanvasDims(_drumCanvas);
-    const _onSongReady = () => _resetForNewChart();
-
-    function _resetForNewChart() {
-        // Wipe scoring + flash buffers + _heldPads so the next chart
-        // doesn't inherit stale state. Critical for Auto-mode
-        // Drums-to-Drums transitions (drum renderer stays selected
-        // across the arrangement switch).
-        _resetScoring();
-        _heldPads.clear();
-        _primeLatestSnapshot();
-    }
 
     return {
         init(canvas /* , bundle */) {
-            if (_drumCanvas) {
-                _teardown(/* restoreCanvas */ false);
+            // Defensive teardown in case a prior init wasn't paired
+            // with destroy. Mirror destroy()'s cleanup exactly —
+            // including restoreCanvas=true. If we skipped the
+            // restore, the prior lifetime's highway canvas would
+            // stay `display:none` going into the fresh capture
+            // below, poisoning `_prevHighwayDisplay` with "none" so
+            // a later destroy() would re-hide the canvas permanently.
+            if (_drumCanvas || _isReady) {
+                window.removeEventListener('resize', _onWinResize);
+                if (window.slopsmith) window.slopsmith.off?.('song:ready', _onSongReady);
+                _midiPauseHandler();
+                _teardown(/* restoreCanvas */ true);
+                _isReady = false;
             }
 
             _highwayCanvas = canvas;
@@ -1121,13 +1305,32 @@ function createFactory() {
                 return;
             }
             _drumCtx = _drumCanvas.getContext('2d');
+            if (!_drumCtx) {
+                // 2D context unavailable — tear down our freshly
+                // built overlay, restore any controls-style override,
+                // and leave the highway canvas visible as a fallback.
+                // Without this abort we'd hide the highway below and
+                // every draw() would silently no-op against a null
+                // ctx, leaving a blank player.
+                console.warn('[Drums] init: getContext("2d") returned null; aborting');
+                _drumCanvas.remove();
+                _drumCanvas = null;
+                _highwayCanvas = null;
+                _prevHighwayDisplay = '';
+                _restoreControlsStyle();
+                return;
+            }
 
             if (_highwayCanvas) _highwayCanvas.style.display = 'none';
 
             _injectSettingsGear();
             _applyCanvasDims(_drumCanvas);
             window.addEventListener('resize', _onWinResize);
-            if (window.slopsmith) window.slopsmith.on('song:ready', _onSongReady);
+            // Optional-chain .on as well as the receiver: older
+            // slopsmith cores (pre-Wave A) expose window.slopsmith
+            // as a plain object without the on/off bus, and a bare
+            // .on(...) call there would throw.
+            window.slopsmith?.on?.('song:ready', _onSongReady);
 
             _resetForNewChart();
 
@@ -1162,8 +1365,9 @@ function createFactory() {
         }
         _removeSettingsPanel();
         _removeSettingsGear();
+        _restoreControlsStyle();
 
-        _heldPads.clear();
+        _releaseAllSounding();
 
         if (restoreCanvas && _highwayCanvas) {
             _highwayCanvas.style.display = _prevHighwayDisplay;
