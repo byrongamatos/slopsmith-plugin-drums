@@ -469,10 +469,14 @@ function _midiUpdateDeviceList() {
 // MIDI device should stop now." Called from _teardown() on destroy
 // AND from _midiConnect() on device switch, so a "None" pick or
 // device-swap doesn't leave pressed-lane animations drooling out.
+// Also clears transient Learn-mode state — _cfg.learnLane is a
+// pending-remap sentinel; leaving it set across a destroy / device
+// swap would silently swallow the next drum hit on the next init.
 function _releaseAllSounding() {
     _heldPads.clear();
     _wrongFlashes.length = 0;
     _laneFlashes.length = 0;
+    _cfg.learnLane = null;
 }
 
 // ═══════════════════════════════════════════════════════════════════════
@@ -483,6 +487,13 @@ function _checkHit(playedMidi) {
     const t = _latestTime;
     const notes = _latestNotes;
     const chords = _latestChords;
+
+    // No chart cached yet (song-change reconnect window, or the
+    // very first frame after init before draw has caught up). Skip
+    // scoring entirely — counting a hit as a miss here would inflate
+    // the miss counter every time the user noodles on the pad during
+    // a song switch, with no matching notes to score against.
+    if (!notes && !chords) return;
 
     const playedLane = _midiToLaneIdx(playedMidi);
     if (playedLane < 0) return;
@@ -752,12 +763,19 @@ function _createSettingsPanel() {
         _saveCfg('customMapping', null);
         // Mapping rows are rendered once during panel construction
         // from the current _getActiveDrumMap(). Rebuild the panel so
-        // the "assigned" column updates to reflect the defaults —
-        // without this the table would keep showing the old custom
-        // mapping until the panel was closed and reopened.
+        // the "assigned" column updates to reflect the defaults.
+        // _removeSettingsPanel forces _settingsVisible=false as part
+        // of tearing the node down; snapshot the prior visibility
+        // state and restore it after the rebuild so the gear toggle
+        // remains in sync — otherwise _settingsVisible and the
+        // actual panel visibility would disagree, and the next gear
+        // click would just flip the flag back to "visible" without
+        // any visual change.
+        const wasSettingsVisible = _settingsVisible;
         _removeSettingsPanel();
         _createSettingsPanel();
-        if (_settingsPanel) _settingsPanel.style.display = '';
+        _settingsVisible = wasSettingsVisible;
+        if (wasSettingsVisible && _settingsPanel) _settingsPanel.style.display = '';
         _midiUpdateDeviceList();
     };
 
