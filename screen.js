@@ -551,6 +551,55 @@ function _updateLearnUI() {
     });
 }
 
+// Build the mapping table rows from the active drum map. Module-scope
+// because customMapping is module-shared state — every open settings
+// panel (across N splitscreen drum instances) should render the same
+// rows. References only module-scope identifiers (DRUM_LANES, _cfg,
+// _getActiveDrumMap, _rgbStr).
+function _buildMappingRows() {
+    return DRUM_LANES.map((lane, idx) => {
+        const map = _getActiveDrumMap();
+        const assigned = Object.entries(map).filter(([_, v]) => v === lane.id).map(([k]) => k).join(', ');
+        return `<tr>
+            <td style="color:${_rgbStr(lane.color[0], lane.color[1], lane.color[2])};font-weight:bold;padding:2px 6px;">${lane.label}</td>
+            <td style="color:#888;padding:2px 6px;font-size:10px;">${assigned || 'none'}</td>
+            <td style="padding:2px 4px;"><button class="drums-learn-btn" data-lane="${idx}"
+                style="background:#1a1a2e;border:1px solid #333;border-radius:4px;padding:1px 6px;
+                font-size:10px;color:${_cfg.learnLane === idx ? '#ff0' : '#aaa'};cursor:pointer;">${_cfg.learnLane === idx ? '...' : 'Learn'}</button></td>
+        </tr>`;
+    }).join('');
+}
+
+// Re-bind Learn-button onclicks within a freshly-rebuilt mapping
+// table. Module-scope because the handler only mutates _cfg.learnLane
+// (module-shared) and calls _updateLearnUI (also module-scope) —
+// no per-instance closure needed.
+function _wireLearnButtons(scope) {
+    scope.querySelectorAll('.drums-learn-btn').forEach(btn => {
+        btn.onclick = function () {
+            const idx = parseInt(this.dataset.lane);
+            _cfg.learnLane = _cfg.learnLane === idx ? null : idx;
+            _updateLearnUI();
+        };
+    });
+}
+
+// Rebuild EVERY open mapping table after a customMapping change
+// (Learn-mode assignment, Reset Map button). Iterating the DOM
+// rather than _instances means we rebuild only the tables that
+// actually exist in the document — instances whose settings panel
+// was never opened simply don't have a `.drums-map-table` node yet,
+// and they pick up the current state when the panel opens later.
+function _refreshAllMappingTables() {
+    const tables = document.querySelectorAll('.drums-map-table');
+    if (!tables.length) return;
+    const html = _buildMappingRows();
+    tables.forEach(tbl => {
+        tbl.innerHTML = html;
+        _wireLearnButtons(tbl);
+    });
+}
+
 // ═══════════════════════════════════════════════════════════════════════
 // Splitscreen helper wrappers
 // ═══════════════════════════════════════════════════════════════════════
@@ -766,7 +815,11 @@ function createFactory() {
             _saveCfg('customMapping', map);
             _cfg.learnLane = null;
             _updateLearnUI();
-            _refreshSettingsMapping();
+            // Rebuild the "assigned" column on EVERY open settings
+            // panel — customMapping is module-shared, so a Learn
+            // assignment from the focused panel must also update
+            // any other splitscreen panel's open settings table.
+            _refreshAllMappingTables();
             return;
         }
 
@@ -965,42 +1018,6 @@ function createFactory() {
         }
     }
 
-    // Rebuild the settings panel's MIDI mapping table after a Learn
-    // assignment. Done in-place rather than rebuilding the whole
-    // panel so the `<details>` open/closed state and the focused
-    // form-control aren't disturbed.
-    function _refreshSettingsMapping() {
-        if (!_settingsPanel) return;
-        const tbl = _settingsPanel.querySelector('.drums-map-table');
-        if (!tbl) return;
-        tbl.innerHTML = _buildMappingRows();
-        _wireLearnButtons(_settingsPanel);
-    }
-
-    function _buildMappingRows() {
-        return DRUM_LANES.map((lane, idx) => {
-            const map = _getActiveDrumMap();
-            const assigned = Object.entries(map).filter(([_, v]) => v === lane.id).map(([k]) => k).join(', ');
-            return `<tr>
-                <td style="color:${_rgbStr(lane.color[0], lane.color[1], lane.color[2])};font-weight:bold;padding:2px 6px;">${lane.label}</td>
-                <td style="color:#888;padding:2px 6px;font-size:10px;">${assigned || 'none'}</td>
-                <td style="padding:2px 4px;"><button class="drums-learn-btn" data-lane="${idx}"
-                    style="background:#1a1a2e;border:1px solid #333;border-radius:4px;padding:1px 6px;
-                    font-size:10px;color:${_cfg.learnLane === idx ? '#ff0' : '#aaa'};cursor:pointer;">${_cfg.learnLane === idx ? '...' : 'Learn'}</button></td>
-            </tr>`;
-        }).join('');
-    }
-
-    function _wireLearnButtons(panel) {
-        panel.querySelectorAll('.drums-learn-btn').forEach(btn => {
-            btn.onclick = function () {
-                const idx = parseInt(this.dataset.lane);
-                _cfg.learnLane = _cfg.learnLane === idx ? null : idx;
-                _updateLearnUI();
-            };
-        });
-    }
-
     function _createSettingsPanel() {
         if (_settingsPanel) return;
         const panelChrome = _ssPanelChrome(_highwayCanvas);
@@ -1091,9 +1108,10 @@ function createFactory() {
             _saveCfg('customMapping', null);
             // Rebuild the mapping table inline so the `<details>`
             // open state and panel scroll position survive the
-            // reset. _refreshSettingsMapping rewires the Learn
-            // button onclicks against the new <button> nodes.
-            _refreshSettingsMapping();
+            // reset. customMapping is module-shared, so refresh
+            // EVERY open settings panel's table — not just this
+            // one — to keep splitscreen UIs consistent.
+            _refreshAllMappingTables();
             _midiUpdateAllDeviceLists();
         };
 
