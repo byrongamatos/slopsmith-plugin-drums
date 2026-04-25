@@ -355,20 +355,41 @@ function _synthSetVolume(vol) {
 // Web MIDI input (module-level — one MIDI access per tab)
 // ═══════════════════════════════════════════════════════════════════════
 
+// In-flight guard for the requestMIDIAccess promise. Wave C calls
+// _midiInit() once per init() — N concurrent splitscreen instances
+// would otherwise race to issue N requestMIDIAccess() calls before
+// the first promise resolves and populates _midiAccess. Some
+// browsers throw a permission prompt per call; even when they
+// don't, both branches land at `_midiAccess = await ...` and the
+// later one overwrites the earlier _midiAccess + onstatechange,
+// dropping any device-list updates that arrived between the two
+// resolutions.
+let _midiInitPromise = null;
+
 async function _midiInit() {
     if (_midiAccess) return;
+    if (_midiInitPromise) return _midiInitPromise;
     if (!navigator.requestMIDIAccess) return;
-    try {
-        _midiAccess = await navigator.requestMIDIAccess({ sysex: false });
-        _midiAccess.onstatechange = () => _midiUpdateAllDeviceLists();
-        _midiAutoConnect();
-        // Populate whatever settings panels are open — may be zero
-        // on first init, but if any instance has its settings open
-        // we want the MIDI <select> filled.
-        _midiUpdateAllDeviceLists();
-    } catch (e) {
-        console.warn('[Drums] MIDI access denied:', e);
-    }
+    _midiInitPromise = (async () => {
+        try {
+            _midiAccess = await navigator.requestMIDIAccess({ sysex: false });
+            _midiAccess.onstatechange = () => _midiUpdateAllDeviceLists();
+            _midiAutoConnect();
+            // Populate whatever settings panels are open — may be zero
+            // on first init, but if any instance has its settings open
+            // we want the MIDI <select> filled.
+            _midiUpdateAllDeviceLists();
+        } catch (e) {
+            console.warn('[Drums] MIDI access denied:', e);
+        } finally {
+            // Drop the in-flight handle. On success, future calls
+            // short-circuit on `_midiAccess`; on rejection, releasing
+            // the slot lets a later init() retry (e.g. user grants
+            // permission after declining the first prompt).
+            _midiInitPromise = null;
+        }
+    })();
+    return _midiInitPromise;
 }
 
 function _midiAutoConnect() {
@@ -445,6 +466,15 @@ function _midiPauseHandler() {
     // user re-picking.
     _midiActive = false;
     if (_midiInput) _midiInput.onmidimessage = null;
+    // Clear pending Learn-mode sentinel — leaving it set would
+    // consume the first drum hit on the NEXT renderer lifetime
+    // (user clicks Learn, closes the last drums panel before
+    // tapping a pad, reopens drums later, hits a pad → silent
+    // remap with no UI explaining why). _updateLearnUI() refreshes
+    // any reopened settings panel; if no panel is open right now
+    // the call is a cheap no-op.
+    _cfg.learnLane = null;
+    _updateLearnUI();
 }
 
 function _midiResumeHandler() {
@@ -1629,6 +1659,20 @@ function createFactory() {
                 _resetForNewChart();
             }
             _lastBundleIsReady = isReady;
+
+            // Refresh the MIDI-scoring snapshot from the LATEST bundle
+            // even on unready frames. Otherwise a pad hit during the
+            // loading / reconnect window scores against the PREVIOUS
+            // chart's _latestNotes (which still hold last song's data
+            // until _draw refreshes them). After bundle.isReady falls
+            // false the new song's notes/chords typically arrive as
+            // [] until the chart loads — that's exactly what we want
+            // here: _checkHit's `notesEmpty && chordsEmpty` guard
+            // bails so unready hits neither score nor mis-score, and
+            // the scoring resumes naturally on the first ready frame.
+            _latestNotes = bundle.notes;
+            _latestChords = bundle.chords;
+            _latestTime = bundle.currentTime;
 
             // Loading / reconnect window — chart isn't confirmed
             // yet. Paint the plugin's base background so the
