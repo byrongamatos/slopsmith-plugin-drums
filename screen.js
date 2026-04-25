@@ -755,6 +755,19 @@ function createFactory() {
 
     // Wave C focus state
     let _isFocused = false;
+    // Tracks whether we successfully subscribed to splitscreen
+    // focus-change events. Necessary because subscribe is gated on
+    // _ssActive() (full helper surface + isActive()===true) but
+    // destroy() must still unsubscribe what was actually attached
+    // — we can't re-derive "did we subscribe?" from a fresh
+    // _ssActive() check at destroy time, since isActive() might
+    // have flipped false (splitscreen toggled off) between init
+    // and destroy. Without this flag a defensive offFocusChange
+    // call against a subscription that never happened would be a
+    // no-op for EventTarget but obscures intent; a missed
+    // unsubscribe of one we DID register would leak the listener
+    // closure across the destroy.
+    let _focusSubscribed = false;
 
     // ── Listener refs (per-instance so destroy() detach matches) ──
     const _onWinResize = () => _applyCanvasDims();
@@ -1582,9 +1595,12 @@ function createFactory() {
             // ever running.
             if (_drumCanvas || _isReady) {
                 window.removeEventListener('resize', _onWinResize);
-                const ss = window.slopsmithSplitscreen;
-                if (ss && typeof ss.offFocusChange === 'function') {
-                    ss.offFocusChange(_onFocusChange);
+                if (_focusSubscribed) {
+                    const ss = window.slopsmithSplitscreen;
+                    if (ss && typeof ss.offFocusChange === 'function') {
+                        ss.offFocusChange(_onFocusChange);
+                    }
+                    _focusSubscribed = false;
                 }
                 _instances.delete(instance);
                 if (_activeInstance === instance) _activeInstance = null;
@@ -1630,16 +1646,18 @@ function createFactory() {
             window.addEventListener('resize', _onWinResize);
 
             const ss = window.slopsmithSplitscreen;
-            // Subscribe only when BOTH on/offFocusChange exist on
-            // the helper. A subscribe-without-unsubscribe path
-            // would leak the listener every init/destroy cycle and
-            // — combined with _ssActive's strict surface check
-            // returning false — also produce inconsistent focus
-            // routing where the listener fires but the wrappers
-            // treat splitscreen as inactive.
-            if (ss && typeof ss.onFocusChange === 'function'
-                   && typeof ss.offFocusChange === 'function') {
+            // Subscribe only when splitscreen is FULLY supported and
+            // active (matches the rest of the plugin's helper gating
+            // through _ssActive). A partial helper that exposes
+            // on/offFocusChange but lacks isCanvasFocused / panelChrome
+            // / settingsAnchor would otherwise let us subscribe while
+            // _ssIsCanvasFocused falls back to "always focused"
+            // (main-player path), so every instance would race to
+            // claim _activeInstance on every focus event and break
+            // MIDI routing under the partial helper.
+            if (_ssActive()) {
                 ss.onFocusChange(_onFocusChange);
+                _focusSubscribed = true;
             }
 
             _resetForNewChart();
@@ -1721,9 +1739,12 @@ function createFactory() {
             // missing offFocusChange call.
             _instanceDestroyed = true;
             window.removeEventListener('resize', _onWinResize);
-            const ss = window.slopsmithSplitscreen;
-            if (ss && typeof ss.offFocusChange === 'function') {
-                ss.offFocusChange(_onFocusChange);
+            if (_focusSubscribed) {
+                const ss = window.slopsmithSplitscreen;
+                if (ss && typeof ss.offFocusChange === 'function') {
+                    ss.offFocusChange(_onFocusChange);
+                }
+                _focusSubscribed = false;
             }
             _instances.delete(instance);
             if (_activeInstance === instance) _activeInstance = null;
